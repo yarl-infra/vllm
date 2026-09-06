@@ -753,32 +753,32 @@ class GPUModelRunner(
         # Capture warmup providers registered by the initial placeholder InputBatch
         with self.jit_warmup_registry.activate():
             self.input_batch = InputBatch(
-            max_num_reqs=self.max_num_reqs,
-            # We need to use the encoder length for encoder-decoder
-            # because of KV cache for cross-attention.
-            max_model_len=max(self.max_model_len, self.max_encoder_len),
-            max_num_batched_tokens=self.max_num_tokens,
-            device=self.device,
-            vocab_size=self.model_config.get_vocab_size(),
-            block_sizes=[placeholder_block_size],
-            kernel_block_sizes=[placeholder_block_size],
-            max_num_blocks_per_req=[placeholder_max_num_blocks],
-            num_spec_tokens=self.num_spec_tokens,
-            logitsprocs=build_logitsprocs(
-                self.vllm_config,
-                self.device,
-                PIN_MEMORY,
-                self.is_pooling_model,
-                custom_logitsprocs,
-            ),
-            # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Thinking-budget
-            # tracking is requested dynamically when a budgeted request is in the
-            # batch.
-            logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
-            is_pooling_model=self.is_pooling_model,
-            cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            reasoning_config=self.vllm_config.reasoning_config,
+                max_num_reqs=self.max_num_reqs,
+                # We need to use the encoder length for encoder-decoder
+                # because of KV cache for cross-attention.
+                max_model_len=max(self.max_model_len, self.max_encoder_len),
+                max_num_batched_tokens=self.max_num_tokens,
+                device=self.device,
+                vocab_size=self.model_config.get_vocab_size(),
+                block_sizes=[placeholder_block_size],
+                kernel_block_sizes=[placeholder_block_size],
+                max_num_blocks_per_req=[placeholder_max_num_blocks],
+                num_spec_tokens=self.num_spec_tokens,
+                logitsprocs=build_logitsprocs(
+                    self.vllm_config,
+                    self.device,
+                    PIN_MEMORY,
+                    self.is_pooling_model,
+                    custom_logitsprocs,
+                ),
+                # We currently don't know whether a particular custom logits processor
+                # uses output token ids so we set this conservatively. Thinking-budget
+                # tracking is requested dynamically when a budgeted request is in the
+                # batch.
+                logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
+                is_pooling_model=self.is_pooling_model,
+                cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+                reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm
                 or self.cache_config.use_replayssm_spec,
             )
@@ -1995,6 +1995,12 @@ class GPUModelRunner(
     def _sync_num_accepted_tokens(
         self, num_reqs: int, prev_req_id_to_index: dict[str, int] | None
     ) -> None:
+        """Synchronize and remap accepted token counts into input_batch.
+
+        In async scheduling mode, remaps counts from runner.num_accepted_tokens.np
+        through prev_positions to account for row shifts from InputBatch.condense().
+        In sync mode, performs a direct write-back to input_batch.
+        """
         if self.use_async_scheduling:
             if prev_req_id_to_index:
                 # Remap the previous-iteration runner snapshot through prev_positions.
@@ -2594,9 +2600,8 @@ class GPUModelRunner(
                     extra_attn_metadata_args["prev_last_scheduled_idx"] = (
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
-                if (
-                    self.replayssm_state is not None
-                    and isinstance(builder, GDNAttentionMetadataBuilder)
+                if self.replayssm_state is not None and isinstance(
+                    builder, GDNAttentionMetadataBuilder
                 ):
                     ctx = self._get_mamba_bufs().postprocess_align
                     assert ctx is not None

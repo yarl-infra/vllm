@@ -1834,6 +1834,7 @@ class TestSyncNumAcceptedTokens:
     for async and non-async modes."""
 
     def test_async_mamba_align_accepted_counts_race(self):
+        """Verify async mode remaps accepted counts when row indices shift."""
         num_reqs = 3
         runner = Mock(spec=GPUModelRunner)
         runner.use_async_scheduling = True
@@ -1857,6 +1858,7 @@ class TestSyncNumAcceptedTokens:
         )
 
     def test_async_initial_step_empty_prev_index(self):
+        """Verify async mode defaults counts to 1 on initial step with empty index."""
         num_reqs = 2
         runner = Mock(spec=GPUModelRunner)
         runner.use_async_scheduling = True
@@ -1875,6 +1877,7 @@ class TestSyncNumAcceptedTokens:
         )
 
     def test_non_async_mode_direct_copy(self):
+        """Verify non-async mode directly writes back accepted counts 1:1."""
         num_reqs = 2
         runner = Mock(spec=GPUModelRunner)
         runner.use_async_scheduling = False
@@ -1907,6 +1910,7 @@ class TestSyncNumAcceptedTokens:
         runner.num_accepted_tokens = SimpleNamespace(
             cpu=Mock(), gpu=torch.zeros(5, dtype=torch.int64)
         )
+        runner.replayssm_state = None
         runner.input_batch = SimpleNamespace(num_accepted_tokens_cpu_tensor=Mock())
         runner._get_mamba_bufs = Mock(return_value=Mock())
         runner.kv_cache_config = Mock()
@@ -1933,6 +1937,9 @@ class TestSyncNumAcceptedTokens:
         )
 
     def test_d2h_target_is_runner_buffer_non_align(self):
+        """Verify non-align mode D2H copy targets runner.num_accepted_tokens.cpu
+        rather than input_batch's tensor.
+        """
         runner = Mock(spec=GPUModelRunner)
         runner.speculative_config = Mock()
         runner.model_config = SimpleNamespace(is_hybrid=True)
