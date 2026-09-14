@@ -2106,14 +2106,14 @@ def _get_packed_kv_cache_groups(
         vllm_config,
         kv_cache_spec,
         groups,
-        use_last_layer_fallback=_uses_last_registered_mtp_attention(vllm_config),
+        use_model_scoped_mtp_fallback=_uses_model_scoped_mtp_attention(vllm_config),
     )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
-def _uses_last_registered_mtp_attention(vllm_config: VllmConfig) -> bool:
-    """Whether the model's MTP attention layer is registered last.
+def _uses_model_scoped_mtp_attention(vllm_config: VllmConfig) -> bool:
+    """Whether the model has an ordinary, unmarked MTP attention layer.
 
     These MTP implementations reuse an ordinary target attention layer, so
     their cache spec has no draft-only marker. The model implementations do,
@@ -2142,7 +2142,7 @@ def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
-    use_last_layer_fallback: bool = False,
+    use_model_scoped_mtp_fallback: bool = False,
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
@@ -2155,14 +2155,11 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for MTP implementations whose block
-       reuses an ordinary target decoder layer and so carries no spec marker.
-       Their draft attention layer is always the last registered layer, so
-       flag whichever group holds it. This rule is only valid where the groups
-       partition exactly the layers of ``kv_cache_spec``, which is true on the
-       packed grouping path and not in general; other callers must leave
-       ``use_last_layer_fallback`` False. The caller gates this fallback on the
-       configured model type.
+    2. Model-scoped fallback for MTP implementations whose block reuses an
+       ordinary target decoder layer and so carries no spec marker. Prefer an
+       explicit ``mtp`` component in the registered layer name. DeepseekV4's
+       MTP block has no such component but is known to register last, so use
+       the last registered layer only when no named MTP layer exists.
        FIXME(yifan): avoid/generalize this hacky check.
 
     Args:
@@ -2170,8 +2167,8 @@ def _annotate_eagle_groups(
         kv_cache_spec: The kv cache spec of each attention layer, in layer
             registration order. Only read by rule 2.
         kv_cache_groups: Groups to annotate in place.
-        use_last_layer_fallback: Enable rule 2 for a model with a known
-            last-registered MTP attention layer on the packed grouping path.
+        use_model_scoped_mtp_fallback: Enable rule 2 for a model with a known
+            ordinary MTP attention layer.
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle_block_drop():
@@ -2184,13 +2181,16 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if not use_last_layer_fallback:
+    if not use_model_scoped_mtp_fallback:
         return
-    last_layer = next(reversed(kv_cache_spec))
+
+    mtp_layers = [
+        name for name in kv_cache_spec if name.startswith("mtp.") or ".mtp." in name
+    ]
+    draft_layers = mtp_layers or [next(reversed(kv_cache_spec))]
     for group in kv_cache_groups:
-        if last_layer in group.layer_names:
+        if any(name in group.layer_names for name in draft_layers):
             group.is_eagle_group = True
-            break
 
 
 def _warn_if_unannotated_eagle_mamba(
@@ -2330,7 +2330,12 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
-    _annotate_eagle_groups(vllm_config, kv_cache_spec, groups)
+    _annotate_eagle_groups(
+        vllm_config,
+        kv_cache_spec,
+        groups,
+        use_model_scoped_mtp_fallback=_uses_model_scoped_mtp_attention(vllm_config),
+    )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
