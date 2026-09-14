@@ -2106,20 +2106,35 @@ def _get_packed_kv_cache_groups(
         vllm_config,
         kv_cache_spec,
         groups,
-        use_deepseek_v4_fallback=_is_deepseek_v4_eagle(vllm_config),
+        use_last_layer_fallback=_uses_last_registered_mtp_attention(vllm_config),
     )
     _warn_if_unannotated_eagle_mamba(vllm_config, groups)
     return groups
 
 
-def _is_deepseek_v4_eagle(vllm_config: VllmConfig) -> bool:
+def _uses_last_registered_mtp_attention(vllm_config: VllmConfig) -> bool:
+    """Whether the model's MTP attention layer is registered last.
+
+    These MTP implementations reuse an ordinary target attention layer, so
+    their cache spec has no draft-only marker. The model implementations do,
+    however, register the MTP block after every target layer. This lets us
+    mark only the attention group containing that last layer instead of the
+    conservative all-groups fallback, which makes aligned Mamba prefix-cache
+    hits impossible.
+    """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    if spec_config is None or spec_config.method != "mtp":
         return False
     model_config = vllm_config.model_config
-    return model_config is not None and model_config.hf_config.model_type in (
+    if model_config is None:
+        return False
+    return model_config.hf_config.model_type in (
         "deepseek_v4",
         "deepseek_v41",
+        "qwen3_5",
+        "qwen3_5_moe",
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
     )
 
 
@@ -2127,7 +2142,7 @@ def _annotate_eagle_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
     kv_cache_groups: list[KVCacheGroupSpec],
-    use_deepseek_v4_fallback: bool = False,
+    use_last_layer_fallback: bool = False,
 ) -> None:
     """Flag the KV cache groups that hold drafter attention layers.
 
@@ -2140,14 +2155,14 @@ def _annotate_eagle_groups(
        spec merging, wherever grouping happens to land. It is sufficient but
        not necessary: a drafter whose spec is indistinguishable from the
        target's cannot be found this way.
-    2. Model-scoped positional fallback for DeepseekV4/V4.1, whose MTP block
-       reuses the target's own decoder layer and so carries no spec marker. Its
-       draft attention layer is always the last registered layer, so flag whichever
-       group holds it. This rule is only valid where the groups partition
-       exactly the layers of ``kv_cache_spec``, which is true on the packed
-       grouping path and not in general; other callers must leave
-       ``use_deepseek_v4_fallback`` False. The caller gates this fallback on
-       the configured model type.
+    2. Model-scoped positional fallback for MTP implementations whose block
+       reuses an ordinary target decoder layer and so carries no spec marker.
+       Their draft attention layer is always the last registered layer, so
+       flag whichever group holds it. This rule is only valid where the groups
+       partition exactly the layers of ``kv_cache_spec``, which is true on the
+       packed grouping path and not in general; other callers must leave
+       ``use_last_layer_fallback`` False. The caller gates this fallback on the
+       configured model type.
        FIXME(yifan): avoid/generalize this hacky check.
 
     Args:
@@ -2155,8 +2170,8 @@ def _annotate_eagle_groups(
         kv_cache_spec: The kv cache spec of each attention layer, in layer
             registration order. Only read by rule 2.
         kv_cache_groups: Groups to annotate in place.
-        use_deepseek_v4_fallback: Enable rule 2 for a DeepseekV4/V4.1 packed
-            group.
+        use_last_layer_fallback: Enable rule 2 for a model with a known
+            last-registered MTP attention layer on the packed grouping path.
     """
     spec_config = vllm_config.speculative_config
     if spec_config is None or not spec_config.use_eagle_block_drop():
@@ -2169,7 +2184,7 @@ def _annotate_eagle_groups(
         ):
             group.is_eagle_group = True
 
-    if not use_deepseek_v4_fallback:
+    if not use_last_layer_fallback:
         return
     last_layer = next(reversed(kv_cache_spec))
     for group in kv_cache_groups:

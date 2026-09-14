@@ -4158,3 +4158,27 @@ def test_deepseek_v4_annotation_requires_model_type():
     )
 
     assert not any(g.is_eagle_group for g in groups)
+
+
+def test_qwen35_mtp_marks_attention_group_but_not_mamba(caplog_vllm):
+    # Qwen3.5's MTP layer is registered last and has the same ordinary cache
+    # spec as target attention layers. The model-scoped positional fallback
+    # must keep aligned Mamba outside the volatile draft group so prefix-cache
+    # reuse remains possible.
+    specs = {
+        "model.layers.0.self_attn.attn": new_mla_spec(block_size=64),
+        "model.layers.1.linear_attn": new_mamba_spec(
+            block_size=64, mamba_cache_mode="align"
+        ),
+        "model.mtp.layers.0.self_attn.attn": new_mla_spec(block_size=64),
+    }
+    groups = get_kv_cache_groups(
+        _spec_decode_grouping_config(method="mtp", model_type="qwen3_5_moe"),
+        specs,
+    )
+
+    flagged = [group for group in groups if group.is_eagle_group]
+    assert len(flagged) == 1
+    assert "model.mtp.layers.0.self_attn.attn" in flagged[0].layer_names
+    assert not isinstance(flagged[0].kv_cache_spec.first_spec, MambaSpec)
+    assert "could be identified as the draft model's" not in caplog_vllm.text
