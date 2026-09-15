@@ -159,6 +159,52 @@ def test_recoverssm_all_groups_see_same_accepted_token_snapshot() -> None:
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_recoverssm_snapshot_handles_mixed_acceptance_across_groups() -> None:
+    """Mixed accepted lengths must stay immutable for every cache group."""
+    state = RecoverSSMState()
+    seen: list[torch.Tensor] = []
+    num_computed = torch.tensor([7, 15, 7, 15], dtype=torch.int32, device="cuda")
+    reset_mask = torch.ones(4, dtype=torch.bool, device="cuda")
+
+    def commit(value: torch.Tensor) -> RecoverSSMPostprocessMetadata:
+        seen.append(value.clone())
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=4,
+            request_indices=None,
+            num_computed_tokens=num_computed,
+            block_size=8,
+            block_table=torch.zeros((4, 4), dtype=torch.int32, device="cuda"),
+            reset_mask=reset_mask,
+        )
+
+    metadata = [Mock(spec=RecoverSSMMetadata) for _ in range(3)]
+    for item in metadata:
+        item.commit_recoverssm_state.side_effect = commit
+    groups = [
+        [SimpleNamespace(layer_names=[f"gdn.{idx}"])] for idx in range(len(metadata))
+    ]
+    state.record_step(
+        {f"gdn.{idx}": item for idx, item in enumerate(metadata)},
+        groups,
+        for_capture=False,
+    )
+
+    num_accepted = torch.tensor([1, 2, 3, 2], dtype=torch.int32, device="cuda")
+    state_indices = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state.commit_step(
+        num_accepted[:],
+        torch.arange(4, dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+        num_accepted_tokens=num_accepted,
+    )
+
+    expected_counts = [1, 2, 3, 2]
+    assert [value.tolist() for value in seen] == [expected_counts] * 3
+    assert state_indices.tolist() == [0, 2, 1, 2]
+    assert num_accepted.tolist() == [1, 1, 1, 1]
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -> None:
     state = object.__new__(MambaHybridModelState)
     state._align_mode = True
