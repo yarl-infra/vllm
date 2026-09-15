@@ -103,7 +103,58 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
         num_accepted_tokens=num_accepted_tokens,
     )
 
-    metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+    metadata.commit_recoverssm_state.assert_called_once()
+    (committed_counts,) = metadata.commit_recoverssm_state.call_args.args
+    torch.testing.assert_close(committed_counts, num_sampled)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_recoverssm_all_groups_see_same_accepted_token_snapshot() -> None:
+    """One group's align reset must not shorten later groups' commits."""
+    state = RecoverSSMState()
+    seen: list[torch.Tensor] = []
+
+    def commit(value: torch.Tensor) -> RecoverSSMPostprocessMetadata:
+        seen.append(value.clone())
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=1,
+            request_indices=None,
+            num_computed_tokens=torch.tensor([7], dtype=torch.int32, device="cuda"),
+            block_size=8,
+            block_table=torch.zeros((1, 4), dtype=torch.int32, device="cuda"),
+            reset_mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+        )
+
+    first = Mock(spec=RecoverSSMMetadata)
+    second = Mock(spec=RecoverSSMMetadata)
+    first.commit_recoverssm_state.side_effect = commit
+    second.commit_recoverssm_state.side_effect = commit
+    groups = [
+        [SimpleNamespace(layer_names=["gdn.0"])],
+        [SimpleNamespace(layer_names=["gdn.1"])],
+    ]
+    state.record_step(
+        {"gdn.0": first, "gdn.1": second}, groups, for_capture=False
+    )
+
+    # Match GPUModelRunner: ``num_sampled`` is a view into the exact buffer
+    # passed as ``num_accepted_tokens`` below.
+    num_accepted = torch.tensor([3], dtype=torch.int32, device="cuda")
+    num_sampled = num_accepted[:1]
+    state_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+    state.commit_step(
+        num_sampled,
+        torch.tensor([0], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+        num_accepted_tokens=num_accepted,
+    )
+
+    assert [value.item() for value in seen] == [3, 3]
+    # Both postprocess launches must compute (7 + 3 - 1) // 8 == 1.  Without
+    # the immutable snapshot the second launch sees the first launch's reset
+    # value (1) and incorrectly overwrites the page index with zero.
+    assert state_indices.item() == 1
+    assert num_accepted.item() == 1
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
