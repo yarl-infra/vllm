@@ -14,6 +14,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     get_temporal_copy_spec,
 )
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    postprocess_recoverssm_align_kernel,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -1054,6 +1057,86 @@ class TestPostprocessMambaFusedKernel:
         # State should be unchanged
         torch.testing.assert_close(conv_state, conv_state_orig)
         torch.testing.assert_close(temporal_state, temporal_state_orig)
+
+    def test_recoverssm_materialized_row_skips_generic_align_copy(
+        self, device, test_config
+    ):
+        """RecoverSSM's materialized boundary must survive generic postprocess."""
+        cfg = test_config
+        cfg.num_layers = 1
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+
+        conv_state = torch.zeros(
+            cfg.num_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        temporal_state = torch.zeros(
+            cfg.num_blocks,
+            cfg.temporal_state_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        # Block 0 is the exact prefix checkpoint; block 1 is the accepted
+        # post-boundary running state.  A second generic align copy would make
+        # the two equal and corrupt the cached prefix checkpoint.
+        conv_state[0].fill_(1)
+        conv_state[1].fill_(2)
+        temporal_state[0].fill_(3)
+        temporal_state[1].fill_(4)
+        conv_orig = conv_state.clone()
+        temporal_orig = temporal_state.clone()
+        forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
+        gpu_ctx = _make_gpu_ctx(cfg, kv_cache_config, device)
+        block_table = torch.arange(8, dtype=torch.int32, device=device)[None]
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context, _COPY_FUNCS, [block_table]
+        )
+        num_accepted = torch.tensor([2], dtype=torch.int32, device=device)
+        state_idx = torch.tensor([0], dtype=torch.int32, device=device)
+        idx_mapping = torch.tensor([0], dtype=torch.int32, device=device)
+        num_computed = torch.tensor([15], dtype=torch.int32, device=device)
+        reset_mask = torch.tensor([True], dtype=torch.bool, device=device)
+
+        # ReplaySSM first materializes the state after token 17 in both the
+        # optimistic running block and its logical prefix page, plus the exact
+        # token-16 checkpoint in block 0. This kernel marks the row as already
+        # handled without replacing the preselected running column.
+        postprocess_recoverssm_align_kernel[(1,)](
+            idx_mapping,
+            num_accepted,
+            None,
+            reset_mask,
+            num_computed,
+            state_idx,
+            num_accepted,
+            MAMBA_BLOCK_SIZE=cfg.block_size,
+            BLOCK_TABLE_WIDTH=block_table.shape[1],
+        )
+
+        # running=16 and, before the fix, accepted=1 made the generic path copy
+        # source column 1 back to destination column 0. It must consume the
+        # ReplaySSM marker without touching either materialized state.
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=1,
+            num_accepted_tokens_gpu=num_accepted,
+            mamba_state_idx_gpu=state_idx,
+            num_scheduled_tokens_gpu=torch.tensor(
+                [3], dtype=torch.int32, device=device
+            ),
+            num_computed_tokens_gpu=num_computed,
+            num_draft_tokens_gpu=torch.tensor([2], dtype=torch.int32, device=device),
+        )
+        torch.accelerator.synchronize()
+
+        torch.testing.assert_close(conv_state, conv_orig)
+        torch.testing.assert_close(temporal_state, temporal_orig)
+        assert state_idx.item() == 0
+        assert gpu_ctx.num_accepted_tokens_out[0].item() == 1
 
     @pytest.mark.parametrize("num_reqs", [1, 2, 8, 16])
     def test_various_batch_sizes(self, device, test_config, num_reqs):

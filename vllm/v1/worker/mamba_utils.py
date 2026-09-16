@@ -445,6 +445,17 @@ def postprocess_mamba_fused_kernel(
 
     # Compute decision logic (mirrors postprocess_mamba Python reference)
     num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
+
+    # A negative value is an internal hand-off sentinel from RecoverSSM.  That
+    # path has already materialized the accepted running state and the exact
+    # prefix-boundary checkpoint, so applying the ordinary align copy again can
+    # overwrite the boundary page with a post-boundary state.  Consume the
+    # sentinel here and expose the usual neutral value to the next iteration.
+    if num_accepted < 0:
+        if state_idx == 0 and tile_idx == 0:
+            tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+        return
+
     src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
 
     if PRECOMPUTED_NEW_COMPUTED:

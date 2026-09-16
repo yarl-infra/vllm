@@ -39,20 +39,18 @@ def postprocess_recoverssm_align_kernel(
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
     if req_state_idx < 0:
         return
-    # The metadata retains the forward's batch-ordered, pre-step snapshot.
-    # post_update advances the separate persistent request-state tensor, so
-    # reconstruct the accepted post-step count here from this batch row.
-    num_computed = tl.load(num_computed_ptr + batch_idx)
-    num_sampled = tl.load(num_sampled_ptr + batch_idx)
-    total_computed = num_computed + num_sampled
-    # Match compute_aligned_state_indices(): an exact block boundary owns the
-    # completed page, not the following page.
-    state_idx = (tl.maximum(total_computed, 1) - 1) // MAMBA_BLOCK_SIZE
-    tl.store(
-        state_idx_ptr + req_state_idx,
-        tl.minimum(state_idx, BLOCK_TABLE_WIDTH - 1),
-    )
-    tl.store(num_accepted_ptr + req_state_idx, 1)
+    # Keep the optimistic running column selected by align preprocessing.  The
+    # ReplaySSM materializer writes the accepted state both to its logical
+    # prefix page and to that running page.  Replacing this column with the
+    # acceptance-derived page would disagree with V1's CPU-side page tracker
+    # and suppress the next required pre-copy at an exact boundary.
+    # RecoverSSM has already materialized both the accepted running state and,
+    # when needed, the exact prefix-boundary checkpoint.  Mark this request so
+    # the generic Mamba align postprocess that runs immediately afterwards does
+    # not copy the newly materialized running page back over the boundary page.
+    # The generic postprocess consumes this private sentinel and restores the
+    # public neutral accepted-token value (1) before returning to the runner.
+    tl.store(num_accepted_ptr + req_state_idx, -1)
 
 
 @dataclass(frozen=True)

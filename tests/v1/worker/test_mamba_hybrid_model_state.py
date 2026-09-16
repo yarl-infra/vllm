@@ -134,9 +134,7 @@ def test_recoverssm_all_groups_see_same_accepted_token_snapshot() -> None:
         [SimpleNamespace(layer_names=["gdn.0"])],
         [SimpleNamespace(layer_names=["gdn.1"])],
     ]
-    state.record_step(
-        {"gdn.0": first, "gdn.1": second}, groups, for_capture=False
-    )
+    state.record_step({"gdn.0": first, "gdn.1": second}, groups, for_capture=False)
 
     # Match GPUModelRunner: ``num_sampled`` is a view into the exact buffer
     # passed as ``num_accepted_tokens`` below.
@@ -151,11 +149,10 @@ def test_recoverssm_all_groups_see_same_accepted_token_snapshot() -> None:
     )
 
     assert [value.item() for value in seen] == [3, 3]
-    # Both postprocess launches must compute (7 + 3 - 1) // 8 == 1.  Without
-    # the immutable snapshot the second launch sees the first launch's reset
-    # value (1) and incorrectly overwrites the page index with zero.
-    assert state_indices.item() == 1
-    assert num_accepted.item() == 1
+    # The optimistic running page is preserved; both groups only consume the
+    # immutable accepted-count snapshot and mark the row as materialized.
+    assert state_indices.item() == 0
+    assert num_accepted.item() == -1
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
@@ -200,8 +197,8 @@ def test_recoverssm_snapshot_handles_mixed_acceptance_across_groups() -> None:
 
     expected_counts = [1, 2, 3, 2]
     assert [value.tolist() for value in seen] == [expected_counts] * 3
-    assert state_indices.tolist() == [0, 2, 1, 2]
-    assert num_accepted.tolist() == [1, 1, 1, 1]
+    assert state_indices.tolist() == [0, 0, 0, 0]
+    assert num_accepted.tolist() == [-1, -1, -1, -1]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
@@ -230,7 +227,10 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias() -
 
     state.postprocess_state(idx_mapping, num_sampled)
 
-    expected_state_indices = [-1, 1, -1, -1, -1]
+    expected_state_indices = [-1, -1, -1, -1, -1]
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
-    expected_accepted = [9, 1, 9, 2, 9]
+    # This fixture intentionally omits the generic align postprocess that
+    # consumes RecoverSSM's private -1 sentinel and restores the public value
+    # to one.
+    expected_accepted = [9, -1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted

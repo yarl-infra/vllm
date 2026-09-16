@@ -248,6 +248,18 @@ def _compact_conv_state_kernel(
         final_values,
         mask=mask & (final_state_idx > null_block_id),
     )
+    # Align-mode preprocessing chooses the running page from the whole
+    # speculative window, before acceptance is known.  That optimistic page is
+    # ``source_state_idx`` and remains the runner's page on the next step.  If
+    # acceptance stops before (or exactly at) the page boundary,
+    # ``final_state_idx`` can point at the preceding logical page.  Keep a
+    # compact copy in both places: ``final_state_idx`` is the prefix-cache
+    # checkpoint, while ``source_state_idx`` is the live running state.
+    tl.store(
+        source_ptr + offs_d[:, None] * dim_stride + offs_h[None, :] * token_stride,
+        final_values,
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -430,6 +442,11 @@ def _materialize_gdn_state_kernel(
             final_state,
             mask=mask_state & (final_state_idx > null_block_id),
         )
+        # See the conv-state copy above.  The source page is the optimistic
+        # running page selected before sampling.  Preserve the accepted state
+        # there as well as in the logical prefix checkpoint so the next decode
+        # step and prefix restoration observe the same recurrence state.
+        tl.store(source_state_ptrs, final_state, mask=mask_state)
 
 
 @triton.jit
