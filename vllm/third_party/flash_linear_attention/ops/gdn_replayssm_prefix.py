@@ -138,11 +138,23 @@ def _prepare_recovery_plan_kernel(
     boundary_recovery_len = prior_recovery_len + next_boundary - num_computed
 
     next_col = next_boundary // mamba_block_size
+    # The guard is sized for the maximum speculative window, whereas this
+    # particular step may be a draft-less T=1 decode. In that case the
+    # scheduler has not allocated ``next_col`` yet. V2's gathered block-table
+    # rows copy only their valid prefix, so reading the first unallocated
+    # column can observe a stale physical ID from the previous row owner and
+    # reset an unrelated request's block-keyed ReplaySSM cursor.
+    #
+    # An exact boundary still belongs to the completed page (the same
+    # ceil-div-minus-one convention used above), hence the strict comparison.
+    scheduled_enters_next_page = (num_computed + query_len) > next_boundary
     next_state_idx = tl.load(
         block_table_ptr
         + request_idx * stride_block_table_row
         + next_col * stride_block_table_col,
-        mask=materialize & (next_col < block_table_width),
+        mask=materialize
+        & scheduled_enters_next_page
+        & (next_col < block_table_width),
         other=null_block_id,
     ).to(tl.int64)
 
