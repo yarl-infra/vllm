@@ -295,6 +295,9 @@ class SchedulerOffloadConfig(NamedTuple):
         # group's source. EAGLE and DCP need additional hand-off semantics.
         supports_partial_tail = (
             spec.blocks_per_chunk == 1
+            # ReplaySSM materializes canonical recurrent states at block
+            # boundaries. Private ring cursors cannot be restored from KV pages.
+            and not vllm_config.cache_config.use_replayssm_spec
             and len(group_block_sizes) == 1
             and has_partial_recurrent_group
             and all(

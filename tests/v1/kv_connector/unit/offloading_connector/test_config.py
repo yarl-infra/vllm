@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for translating vLLM cache metadata to native offloading config."""
 
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -34,6 +35,60 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
 
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_replayssm_offload_excludes_unmaterialized_partial_tail(replayssm):
+    """A ReplaySSM page without its private cursors is only valid at a boundary."""
+    config = _make_vllm_config()
+    config.cache_config.use_replayssm_spec = replayssm
+    config.cache_config.prefix_match_unit = 4
+    config.speculative_config = None
+    kv_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_config))
+    actual = SchedulerOffloadConfig.from_spec(spec, config, kv_config)
+    assert actual.supports_partial_tail is (not replayssm)
+
+
+@pytest.mark.parametrize(
+    "connector,mode,prefix,mrv2,allowed",
+    [
+        ("OffloadingConnector", "align", True, True, True),
+        ("OffloadingConnector", "align", True, False, False),
+        ("OffloadingConnector", "none", False, True, False),
+        ("SimpleCPUOffloadConnector", "align", True, True, False),
+        ("NixlConnector", "align", True, True, False),
+    ],
+)
+def test_replayssm_only_allows_canonical_native_offload(
+    connector, mode, prefix, mrv2, allowed
+):
+    """Do not widen support to connectors which can transfer live replay state."""
+    from vllm.config.mamba import MambaBackendEnum
+
+    config = SimpleNamespace(
+        model_config=None,
+        use_v2_model_runner=mrv2,
+        cache_config=SimpleNamespace(
+            use_replayssm_spec=True,
+            use_replayssm=False,
+            mamba_cache_mode=mode,
+            enable_prefix_caching=prefix,
+            replayssm_buffer_len=32,
+        ),
+        speculative_config=SimpleNamespace(),
+        num_speculative_tokens=2,
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON,
+            enable_stochastic_rounding=False,
+        ),
+        kv_transfer_config=KVTransferConfig(kv_connector=connector, kv_role="kv_both"),
+    )
+    if allowed:
+        assert VllmConfig.validate_mamba_cached_spec_kernel(config) is config
+    else:
+        with pytest.raises(ValueError):
+            VllmConfig.validate_mamba_cached_spec_kernel(config)
+
+
 def _make_vllm_config(
     *,
     extra_config: dict[str, Any] | None = None,
@@ -48,6 +103,7 @@ def _make_vllm_config(
     config.cache_config.prefix_match_unit = None
     config.cache_config.cache_dtype = torch.float16
     config.cache_config.prefix_cache_retention_interval = None
+    config.cache_config.use_replayssm_spec = False
     config.model_config.model = "test-model"
     config.model_config.use_mla = False
     # _full_attention_spec's heads at tp=1: the parallelism-agnostic gate

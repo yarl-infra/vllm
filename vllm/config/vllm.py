@@ -3278,10 +3278,19 @@ class VllmConfig:
             self.kv_transfer_config is not None
             and self.kv_transfer_config.is_kv_transfer_instance
         ):
-            raise ValueError(
-                "--use-replayssm-spec is incompatible with KV connectors "
-                "(P/D disaggregation, KV cache offload)"
+            native_aligned_offload = (
+                self.use_v2_model_runner
+                and self.kv_transfer_config.kv_connector == "OffloadingConnector"
+                and self.kv_transfer_config.kv_connector_module_path is None
+                and self.cache_config.mamba_cache_mode == "align"
+                and self.cache_config.enable_prefix_caching
             )
+            if not native_aligned_offload:
+                raise ValueError(
+                    "--use-replayssm-spec only supports the native "
+                    "OffloadingConnector on model runner V2 with prefix caching and "
+                    "--mamba-cache-mode align; other KV connectors are unsupported"
+                )
         # The ring holds L = B + max_spec_len slots and flushes once the next
         # window would not fit, so B below max_spec_len can never seat a window.
         max_spec_len = 1 + self.num_speculative_tokens
