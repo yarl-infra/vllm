@@ -1294,14 +1294,16 @@ class VllmConfig:
                     "parallelism (DCP > 1 or PCP > 1)."
                 )
 
-            # Incompatible with any KV connector — covers both PD disaggregation
-            # (kv_producer/kv_consumer: routing captured on P can't reach D) and
-            # single-instance KV offload/sharing (kv_both: slot_mapping semantics
-            # change when KV blocks live outside local GPU memory, breaking the
-            # slot-indexed routed_experts buffer).
+            # Native CPU offload preserves the slot-indexed routing sidecar.
+            # Other connectors cannot transport historical prompt routes.
             if (
                 self.kv_transfer_config is not None
                 and self.kv_transfer_config.is_kv_transfer_instance
+                and not (
+                    self.kv_transfer_config.kv_connector == "OffloadingConnector"
+                    and self.kv_transfer_config.kv_connector_module_path is None
+                    and self.kv_transfer_config.kv_role == "kv_both"
+                )
             ):
                 raise ValueError(
                     "--enable-return-routed-experts is incompatible with KV "

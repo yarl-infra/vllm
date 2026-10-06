@@ -104,6 +104,21 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
+    def set_routed_experts_manager(self, manager: Any) -> None:
+        self.scheduler.set_routed_experts_manager(manager)
+
+    def capture_routed_experts(
+        self,
+        metadata: KVConnectorMetadata | None,
+        scheduled: dict[str, int],
+        before_forward_routes: bool,
+    ) -> None:
+        if metadata is not None:
+            assert isinstance(metadata, OffloadingConnectorMetadata)
+            self.scheduler.capture_routed_experts(
+                metadata, scheduled, before_forward_routes
+            )
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)

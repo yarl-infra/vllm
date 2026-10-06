@@ -70,6 +70,7 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    routed_experts_store_jobs: tuple[int, ...] = ()
 
 
 @dataclass

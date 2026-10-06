@@ -389,6 +389,7 @@ class Scheduler(SchedulerInterface):
             vllm_config.model_config.enable_return_routed_experts
         )
         self.return_sampling_mask = vllm_config.model_config.return_sampling_mask
+        self._routed_experts_connector = None
 
         if self.enable_return_routed_experts:
             assert self.dcp_world_size == 1 and self.pcp_world_size == 1, (
@@ -400,6 +401,16 @@ class Scheduler(SchedulerInterface):
                 vllm_config=vllm_config,
                 kv_cache_config=kv_cache_config,
             )
+            if self.connector is not None:
+                from vllm.distributed.kv_transfer.kv_connector.v1 import (
+                    offloading_connector,
+                )
+
+                assert isinstance(
+                    self.connector, offloading_connector.OffloadingConnector
+                )
+                self.connector.set_routed_experts_manager(self.routed_experts_mgr)
+                self._routed_experts_connector = self.connector
             # Block-ID snapshot taken at schedule time (before forward),
             # so update_from_output can read slot data even if a later
             # schedule() frees the blocks (async scheduling race).
@@ -1921,6 +1932,12 @@ class Scheduler(SchedulerInterface):
         # MUST precede the per-request routing reads below: stopped
         # requests may terminate on tokens generated in this very step,
         # whose routing was just D2H'd into model_runner_output.
+        if self._routed_experts_connector is not None:
+            self._routed_experts_connector.capture_routed_experts(
+                scheduler_output.kv_connector_metadata,
+                num_scheduled_tokens,
+                before_forward_routes=True,
+            )
         routing_data = None
         routing_offsets: dict[str, int] = {}
         if model_runner_output.routed_experts is not None:
@@ -1936,6 +1953,13 @@ class Scheduler(SchedulerInterface):
             for rid in model_runner_output.req_ids:
                 routing_offsets[rid] = offset
                 offset += num_scheduled_tokens[rid]
+
+        if self._routed_experts_connector is not None:
+            self._routed_experts_connector.capture_routed_experts(
+                scheduler_output.kv_connector_metadata,
+                num_scheduled_tokens,
+                before_forward_routes=False,
+            )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best

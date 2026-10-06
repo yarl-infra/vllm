@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+import numpy as np
 import pytest
 import torch
 
@@ -32,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
     OffloadingConnectorScheduler,
     RequestOffloadState,
+    TransferJobStatus,
     get_sliding_window_size_in_chunks,
 )
 from vllm.v1.core.block_pool import BlockPool
@@ -76,6 +78,162 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
+
+
+def _routed_offload_scheduler(capacity=8):
+    group = KVCacheGroupSpec(
+        ["layer"],
+        FullAttentionSpec(
+            block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
+        ),
+    )
+    manager = CPUOffloadingManager(num_chunks=capacity)
+    spec = SimpleNamespace(
+        config=SimpleNamespace(
+            groups=(SimpleNamespace(group_id=0, tokens_per_block=4),)
+        ),
+        tokens_per_block=(4,),
+        tokens_per_hash=4,
+        blocks_per_chunk=1,
+        offload_prompt_only=False,
+        kv_events_config=OffloadingKVEventsConfig(
+            enable_kv_cache_events=False, self_describing_kv_events=False
+        ),
+        get_manager=lambda: manager,
+    )
+    config = SimpleNamespace(
+        speculative_config=None,
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True,
+            prefix_cache_retention_interval=None,
+            use_replayssm_spec=False,
+        ),
+        parallel_config=SimpleNamespace(world_size=1, decode_context_parallel_size=1),
+    )
+    scheduler = OffloadingConnectorScheduler(
+        spec,
+        config,
+        KVCacheConfig(num_blocks=16, kv_cache_tensors=[], kv_cache_groups=[group]),
+    )
+    routes = SimpleNamespace(
+        attn_gid=0,
+        block_size=4,
+        routed_experts_by_slot=np.zeros((64, 2, 2), dtype=np.uint8),
+    )
+    scheduler.set_routed_experts_manager(routes)
+    request = MagicMock()
+    request.request_id = "routes"
+    request.kv_transfer_params = None
+    request.num_tokens = request.num_prompt_tokens = 13
+    request.block_hashes = [BlockHash(f"route{i}".encode()) for i in range(3)]
+    request.skip_reading_prefix_cache = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    return scheduler, routes, request, state
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("workers", [1, 2])
+def test_routed_offload_snapshots_before_slot_reuse_and_restores_new_slot(
+    active, workers
+):
+    scheduler, routes, request, state = _routed_offload_scheduler()
+    key = state.group_states[0].offload_keys[0]
+    scheduler._prepare_store([key], state.req_context)
+    state.transfer_jobs.add(0)
+    assert scheduler._generate_job_id() == 0
+    scheduler._jobs[0] = TransferJobStatus(
+        req_id=request.request_id,
+        pending_count=workers,
+        keys={key},
+        is_store=True,
+        route_blocks={key: 2},
+    )
+    expected = np.arange(16, dtype=np.uint8).reshape(4, 2, 2)
+    metadata = OffloadingConnectorMetadata(
+        load_jobs={},
+        store_jobs={0: None},
+        jobs_to_flush=set(),
+        routed_experts_store_jobs=(0,),
+    )
+    if not active:
+        # The uniprocess worker removes a new flushed job before returning.
+        metadata.store_jobs.pop(0)
+    scheduled = {request.request_id: 4} if active else {"new-occupant": 4}
+    routes.routed_experts_by_slot[8:12] = expected if not active else 255
+    scheduler.capture_routed_experts(metadata, scheduled, True)
+    routes.routed_experts_by_slot[8:12] = expected if active else 255
+    scheduler.capture_routed_experts(metadata, scheduled, False)
+    routes.routed_experts_by_slot[8:12] = 42
+    if workers == 2:
+        scheduler.update_connector_output(
+            KVConnectorOutput(
+                kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={0: 1})
+            )
+        )
+        assert key not in scheduler.routed_experts.cache
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(completed_jobs={0: 1})
+        )
+    )
+    np.testing.assert_array_equal(scheduler.routed_experts.cache[key], expected)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, True)
+    blocks = KVCacheBlocks(([KVCacheBlock(block_id=7)],))
+    scheduler.update_state_after_alloc(request, blocks, 4)
+    load_id = next(iter(state.transfer_jobs))
+    routes.routed_experts_by_slot[28:32] = 99
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={load_id: 1}
+            )
+        )
+    )
+    np.testing.assert_array_equal(routes.routed_experts_by_slot[28:32], expected)
+
+
+def test_routed_offload_missing_routes_recomputes_and_eviction_removes_sidecar():
+    scheduler, routes, request, state = _routed_offload_scheduler(capacity=1)
+    key, next_key = state.group_states[0].offload_keys[:2]
+    scheduler._prepare_store([key], state.req_context)
+    scheduler.manager.complete_store([key], state.req_context)
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    scheduler.routed_experts.cache[key] = routes.routed_experts_by_slot[:4].copy()
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (4, True)
+    scheduler._prepare_store([next_key], state.req_context)
+    assert key not in scheduler.routed_experts.cache
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+
+
+def test_routed_offload_reset_discards_pending_snapshots_and_stale_completion():
+    scheduler, routes, request, state = _routed_offload_scheduler()
+    key = state.group_states[0].offload_keys[0]
+    scheduler._prepare_store([key], state.req_context)
+    job_id = scheduler._generate_job_id()
+    state.transfer_jobs.add(job_id)
+    scheduler._jobs[job_id] = TransferJobStatus(
+        req_id=request.request_id,
+        pending_count=1,
+        keys={key},
+        is_store=True,
+        route_blocks={key: 2},
+        route_data={key: routes.routed_experts_by_slot[:4].copy()},
+    )
+    scheduler.routed_experts.cache[key] = routes.routed_experts_by_slot[:4].copy()
+    scheduler.reset_cache()
+    assert not scheduler.routed_experts.cache
+    assert not scheduler._jobs
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={job_id: 1}
+            )
+        )
+    )
+    assert not scheduler.routed_experts.cache
 
 
 @pytest.mark.parametrize("boundary", [3840, 3904])
@@ -1521,6 +1679,7 @@ def _make_scheduler_with_lookup(
     scheduler = object.__new__(OffloadingConnectorScheduler)
     scheduler.manager = manager
     scheduler._events_tracker = MagicMock()
+    scheduler.routed_experts = None
     return scheduler
 
 
