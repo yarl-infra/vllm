@@ -26,9 +26,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     _ConnectorMetricName,
     _TransferMetricName,
 )
-from vllm.distributed.kv_transfer.kv_connector.v1.offloading.routing import (
-    OffloadedRoutedExperts,
-)
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -84,8 +81,6 @@ class TransferJobStatus:
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
     fenced_block_ids: list[int] | None = None
-    route_blocks: dict[OffloadKey, int] = field(default_factory=dict)
-    route_data: dict[OffloadKey, Any] | None = None
 
 
 class GroupOffloadConfig(NamedTuple):
@@ -611,53 +606,6 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
-        self.routed_experts: OffloadedRoutedExperts | None = None
-
-    def set_routed_experts_manager(self, manager: Any) -> None:
-        from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
-
-        if (
-            not isinstance(self.manager, CPUOffloadingManager)
-            or self.config.blocks_per_chunk != 1
-            or self.config.supports_partial_tail
-            or self.config.tokens_per_hash != manager.block_size
-            or manager.attn_gid
-            not in {group.group_idx for group in self.config.kv_group_configs}
-        ):
-            raise ValueError(
-                "Routed-experts offload requires native CPU, one block per "
-                "chunk, and complete-block cache boundaries."
-            )
-        self.routed_experts = OffloadedRoutedExperts(manager)
-        logger.info(
-            "Native KV offload preserves routed experts: group=%d, tokens/block=%d",
-            manager.attn_gid,
-            manager.block_size,
-        )
-
-    def capture_routed_experts(
-        self,
-        metadata: OffloadingConnectorMetadata,
-        scheduled: dict[str, int],
-        before_forward_routes: bool,
-    ) -> None:
-        if self.routed_experts is None:
-            return
-        for job_id in metadata.routed_experts_store_jobs:
-            job = self._jobs.get(job_id)
-            if (
-                job is not None
-                and job.route_data is None
-                and (job.req_id not in scheduled) == before_forward_routes
-            ):
-                job.route_data = self.routed_experts.snapshot(job.route_blocks)
-
-    def _prepare_store(self, keys: list[OffloadKey], context: ReqContext):
-        result = self.manager.prepare_store(keys, context)
-        if result is not None and self.routed_experts is not None:
-            for key in result.evicted_keys:
-                self.routed_experts.cache.pop(key, None)
-        return result
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -707,12 +655,6 @@ class OffloadingConnectorScheduler:
         hit_count = 0
         defer_lookup = False
         for local_idx, key in enumerate(keys):
-            if (
-                self.routed_experts is not None
-                and group_config.group_idx == self.routed_experts.manager.attn_gid
-                and key not in self.routed_experts.cache
-            ):
-                break
             result = self.manager.lookup(key, req_context)
             match result:
                 case LookupResult.HIT:
@@ -1143,7 +1085,6 @@ class OffloadingConnectorScheduler:
             assert partial_tail_boundary == num_cached_tokens
 
         keys_to_load: list[OffloadKey] = []
-        route_blocks: dict[OffloadKey, int] = {}
         dst_block_ids: list[int] = []
         # per group
         group_sizes: list[int] = []
@@ -1208,16 +1149,6 @@ class OffloadingConnectorScheduler:
                 block.block_id
                 for block in group_blocks[load_start_gpu_block_idx:num_gpu_blocks]
             )
-            if (
-                self.routed_experts is not None
-                and group_config.group_idx == self.routed_experts.manager.attn_gid
-            ):
-                route_blocks.update(
-                    {
-                        offload_keys[i]: group_blocks[i].block_id
-                        for i in range(load_start_gpu_block_idx, num_gpu_blocks)
-                    }
-                )
             group_sizes.append(num_pending_gpu_blocks)
             block_indices.append(load_start_gpu_block_idx)
 
@@ -1246,12 +1177,6 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
-            route_blocks=route_blocks,
-            route_data=(
-                {key: self.routed_experts.cache[key] for key in route_blocks}
-                if self.routed_experts is not None
-                else None
-            ),
         )
 
         if self._chunks_being_loaded is not None:
@@ -1341,7 +1266,7 @@ class OffloadingConnectorScheduler:
                     continue
 
                 key = self._make_boundary_key(req, group_idx, boundary)
-                store_output = self._prepare_store([key], req_status.req_context)
+                store_output = self.manager.prepare_store([key], req_status.req_context)
                 if store_output is None:
                     self._connector_stats.increase_counter(
                         _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1446,7 +1371,7 @@ class OffloadingConnectorScheduler:
             ]
             assert all(block_id != 0 for block_id in block_ids)
 
-            store_output = self._prepare_store(keys, req_status.req_context)
+            store_output = self.manager.prepare_store(keys, req_status.req_context)
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1695,7 +1620,9 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
-            store_output = self._prepare_store(new_offload_keys, req_status.req_context)
+            store_output = self.manager.prepare_store(
+                new_offload_keys, req_status.req_context
+            )
             if store_output is None:
                 self._connector_stats.increase_counter(
                     _ConnectorMetricName.ALLOCATION_FAILURE
@@ -1716,7 +1643,6 @@ class OffloadingConnectorScheduler:
             src_block_ids: list[int] = []
             fenced_block_ids: list[int] = []
             deferred_fence_block_ids: list[int] = []
-            route_blocks: dict[OffloadKey, int] = {}
             for group_config, group_state, store_range in zip(
                 self.config.kv_group_configs,
                 req_status.group_states,
@@ -1749,12 +1675,6 @@ class OffloadingConnectorScheduler:
                         if start_gpu_block_idx is None:
                             start_gpu_block_idx = gpu_block_idx + i
                         src_block_ids.append(block_id)
-                        if (
-                            self.routed_experts is not None
-                            and group_config.group_idx
-                            == self.routed_experts.manager.attn_gid
-                        ):
-                            route_blocks[offload_key] = block_id
                         num_group_blocks += 1
                         if is_sliding_window:
                             fenced_block_ids.append(block_id)
@@ -1793,7 +1713,6 @@ class OffloadingConnectorScheduler:
                 is_store=True,
                 deferred_fence_block_ids=deferred_fence_block_ids,
                 fenced_block_ids=fenced_block_ids or None,
-                route_blocks=route_blocks,
             )
 
             store_jobs[job_id] = TransferJob(
@@ -1856,11 +1775,6 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
-            routed_experts_store_jobs=(
-                tuple(partial_store_jobs) + tuple(normal_store_jobs)
-                if self.routed_experts is not None
-                else ()
-            ),
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1944,14 +1858,6 @@ class OffloadingConnectorScheduler:
             assert job_status.pending_count == 0
 
             req_status = self._req_status[job_status.req_id]
-            if self.routed_experts is not None:
-                assert job_status.route_data is not None
-                if job_status.is_store:
-                    self.routed_experts.cache.update(job_status.route_data)
-                else:
-                    self.routed_experts.restore(
-                        job_status.route_blocks, job_status.route_data
-                    )
             if job_status.is_store:
                 self.manager.complete_store(job_status.keys, req_status.req_context)
             else:
@@ -2062,8 +1968,6 @@ class OffloadingConnectorScheduler:
 
         # Reset offloading manager cache
         self.manager.reset_cache()
-        if self.routed_experts is not None:
-            self.routed_experts.cache.clear()
 
         # Reset store progress so active requests re-offload from chunk 0.
         for status in self._req_status.values():

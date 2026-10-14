@@ -1,0 +1,32 @@
+This branch reconstructs the main installed vLLM package from Porto
+616a8400-e33f-4144-a2d3-71227731d87a on top of the locally recovered history.
+It does NOT reconstruct the missing upstream/GitLab commits.
+
+Image: registry.yandex.net/zeliboba/frameworks/verl/experimental:ydt218-5458341-kvoffload-20261010-r2
+Image ID: sha256:e9d4124b1141c4712535380d38ad876d77face1360828d30f51f512f26711cbb
+Installed package base commit from direct_url.json: 708ad990d2c235432a1ecf0534d498aaa487dc61
+Image patch-source tip: da657aec1fe72e7f57472acc3a7702b446f5a6cb
+Recovery parent: da657aec1fe72e7f57472acc3a7702b446f5a6cb
+Extracted package: /home/vasilievpavel/vllm-porto-616a8400/vllm
+
+The main vllm/ package source files are byte-identical to the extraction.
+The following wheel/build dependencies and artifacts were excluded:
+  __pycache__/, *.pyc, *.so, vllm/vllm-rs, vllm/_version.py,
+  vllm/third_party/, vllm/vllm_flash_attn/cute/,
+  vllm/vllm_flash_attn/layers/, vllm/vllm_flash_attn/ops/.
+The full installed package including these artifacts is preserved in the
+extraction directory. This branch is not a complete source checkout of the
+image's base revision: repository-level build files, csrc/, and tests/ remain
+from the recovery parent. A clean rebuild of this mixed checkout is not
+validated. Prefer the original image's native extensions for local work.
+
+The old offloading/routing.py was removed to match the image; its contents
+remain recoverable from the parent commit and the original branch.
+
+Verification on 2026-10-14:
+  rsync checksum dry-run for the above package scope: no differences.
+  git diff --check: passed.
+  Original image, checkout mounted read-only at /snapshot, isolated uv venv
+  with system site-packages: python -m pytest -q -p no:cacheprovider
+  /snapshot/vllm/test_routed_experts_offload.py: 25 passed in 13.85 seconds.
+  Tests imported /snapshot/vllm; no GPU inference or clean build was run.

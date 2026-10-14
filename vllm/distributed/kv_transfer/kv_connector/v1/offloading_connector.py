@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
 from functools import cached_property
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -48,6 +48,14 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.routed_experts import (
+        RoutedExpertsOffloadManager,
+    )
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        RoutedExpertsManager,
+    )
+
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     @cached_property
@@ -86,6 +94,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         offloading_config = build_offloading_config(vllm_config, kv_cache_config)
         self._canonical_layout = offloading_config.canonical_layout
         spec = OffloadingSpecFactory.create_spec(offloading_config)
+        self._offloading_spec = spec
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
@@ -98,26 +107,29 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
                 spec, vllm_config, kv_cache_config
             )
 
+    def create_routed_experts_offload_manager(
+        self, routed_experts: "RoutedExpertsManager"
+    ) -> "RoutedExpertsOffloadManager | None":
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+            routed_experts as routed_experts_offload,
+        )
+        from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
+
+        assert self.connector_scheduler is not None
+        offloading_group_ids = get_offloading_group_ids(self._kv_cache_config)
+        if routed_experts.attn_gid not in offloading_group_ids:
+            return None
+        spec = self._offloading_spec
+        assert type(spec) is CPUOffloadingSpec
+        return routed_experts_offload.RoutedExpertsOffloadManager(
+            routed_experts, spec.num_chunks, spec.blocks_per_chunk
+        )
+
     def shutdown(self) -> None:
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
-
-    def set_routed_experts_manager(self, manager: Any) -> None:
-        self.scheduler.set_routed_experts_manager(manager)
-
-    def capture_routed_experts(
-        self,
-        metadata: KVConnectorMetadata | None,
-        scheduled: dict[str, int],
-        before_forward_routes: bool,
-    ) -> None:
-        if metadata is not None:
-            assert isinstance(metadata, OffloadingConnectorMetadata)
-            self.scheduler.capture_routed_experts(
-                metadata, scheduled, before_forward_routes
-            )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None

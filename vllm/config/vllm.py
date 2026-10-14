@@ -1073,6 +1073,30 @@ class VllmConfig:
         ):
             return
 
+        if (
+            self.model_config is not None
+            and self.model_config.enable_return_routed_experts
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            # Routing is mirrored alongside native CPU offload blocks. Other
+            # connectors can import KV from engines that do not share this
+            # scheduler's routing buffer, so kv_both alone is not sufficient.
+            transfer = self.kv_transfer_config
+            extra = transfer.kv_connector_extra_config
+            if not (
+                transfer.kv_connector == "OffloadingConnector"
+                and transfer.kv_role == "kv_both"
+                and transfer.kv_connector_module_path is None
+                and extra.get("spec_name", "CPUOffloadingSpec") == "CPUOffloadingSpec"
+                and extra.get("spec_module_path") is None
+            ):
+                raise ValueError(
+                    "--enable-return-routed-experts supports KV connectors only "
+                    "with native CPU KV cache offload (OffloadingConnector, "
+                    "CPUOffloadingSpec, kv_both). PD disaggregation and other "
+                    "KV connectors/offloading specs remain unsupported."
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.
@@ -1292,22 +1316,6 @@ class VllmConfig:
                 raise ValueError(
                     "--enable-return-routed-experts is incompatible with context "
                     "parallelism (DCP > 1 or PCP > 1)."
-                )
-
-            # Native CPU offload preserves the slot-indexed routing sidecar.
-            # Other connectors cannot transport historical prompt routes.
-            if (
-                self.kv_transfer_config is not None
-                and self.kv_transfer_config.is_kv_transfer_instance
-                and not (
-                    self.kv_transfer_config.kv_connector == "OffloadingConnector"
-                    and self.kv_transfer_config.kv_connector_module_path is None
-                    and self.kv_transfer_config.kv_role == "kv_both"
-                )
-            ):
-                raise ValueError(
-                    "--enable-return-routed-experts is incompatible with KV "
-                    "connectors (PD disaggregation, KV cache offload)."
                 )
 
         if (
