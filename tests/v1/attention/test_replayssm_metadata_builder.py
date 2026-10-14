@@ -6,6 +6,7 @@ per-request ring origin (replayssm_decode_base) and num_computed.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,11 +17,98 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.mamba import MambaBackendEnum
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def _make_spec_replay_config(num_spec: int, mode: str):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=mode == "decode",
+            use_replayssm_spec=mode == "spec",
+            replayssm_buffer_len=16,
+            mamba_cache_mode="align",
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.TRITON),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            max_cudagraph_capture_size=0,
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=num_spec, parallel_drafting=False
+        ),
+        num_speculative_tokens=num_spec,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+
+
+@pytest.mark.parametrize("num_spec", [2, 3])
+@pytest.mark.parametrize("mode", ["none", "decode", "spec"])
+def test_ple_spec_metadata_with_global_replayssm(
+    num_spec: int, mode: str, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    config = _make_spec_replay_config(num_spec, mode)
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((9 + num_spec, 8),),
+        dtypes=(torch.float32,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+    )
+    builder = PleShortConvAttentionMetadataBuilder(spec, ["ple"], config, DEVICE)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[32, 48], query_lens=[num_spec + 1] * 2),
+        BLOCK_SIZE,
+        DEVICE,
+    )
+    accepted = torch.tensor([1, num_spec], dtype=torch.int32)
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=torch.tensor([num_spec] * 2),
+    )
+    assert metadata.num_spec_decodes == 2
+    assert metadata.spec_query_start_loc.tolist() == [
+        0,
+        num_spec + 1,
+        2 * (num_spec + 1),
+    ]
+    assert torch.equal(metadata.num_accepted_tokens, accepted)
+    assert torch.equal(
+        metadata.spec_state_indices_tensor, common.block_table_tensor[[0, 1], [1, 2]]
+    )
+    assert not builder.use_replayssm
+    assert not builder.use_replayssm_spec
+    assert config.cache_config.use_replayssm_spec == (mode == "spec")
+
+
+@pytest.mark.parametrize("valid_page", [False, True])
+def test_mamba2_spec_replay_still_validates_page(valid_page: bool):
+    config = _make_spec_replay_config(2, "spec")
+    shapes = ((4, 2), (1, 1, 1), (32, 2), (1, 32))
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=shapes if valid_page else shapes[:2],
+        dtypes=(torch.float32,) * (4 if valid_page else 2),
+        mamba_type=MambaAttentionBackendEnum.MAMBA2,
+    )
+    if not valid_page:
+        with pytest.raises(ValueError, match="4-tensor Mamba2 page"):
+            MockMambaBuilder(spec, ["mamba"], config, DEVICE)
+    else:
+        builder = MockMambaBuilder(spec, ["mamba"], config, DEVICE)
+        assert builder.use_replayssm_spec
+        assert builder.decode_spec_bc_pre is not None
 
 
 @dataclass

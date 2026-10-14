@@ -35,7 +35,11 @@ if TYPE_CHECKING:
 
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
     if kv_cache_config.hisparse_host_num_blocks is None:
-        return tuple(range(len(kv_cache_config.kv_cache_groups)))
+        return tuple(
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if group.kv_cache_spec.prefix_cacheable
+        )
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)

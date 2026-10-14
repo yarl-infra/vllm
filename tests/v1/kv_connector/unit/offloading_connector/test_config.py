@@ -19,6 +19,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
 )
 from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -148,6 +149,22 @@ def _make_kv_cache_config() -> KVCacheConfig:
         kv_cache_tensors=[kv_tensor],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
     )
+
+
+def test_offloading_excludes_non_cacheable_compression_scratch():
+    config = _make_vllm_config()
+    kv_config = _make_kv_cache_config()
+    kv_config.kv_cache_groups.append(
+        KVCacheGroupSpec(
+            ["compression_scratch"],
+            CircularBufferSpec(
+                block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        )
+    )
+    actual = build_offloading_config(config, kv_config)
+    assert [group.group_id for group in actual.groups] == [0]
+    assert actual.cache.tokens_per_hash == 16
 
 
 def _make_sizing_kv_cache_config(packed: bool) -> KVCacheConfig:

@@ -2135,6 +2135,8 @@ def _uses_model_scoped_mtp_attention(vllm_config: VllmConfig) -> bool:
         "qwen3_5_moe",
         "qwen3_5_text",
         "qwen3_5_moe_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
     )
 
 

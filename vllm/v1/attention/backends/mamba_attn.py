@@ -17,6 +17,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     compute_causal_conv1d_metadata,
@@ -115,13 +116,16 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         self.compilation_config = vllm_config.compilation_config
         self.num_spec_tokens: int = vllm_config.num_speculative_tokens
         self.use_spec_decode = self.num_spec_tokens > 0
-        self.use_replayssm = vllm_config.cache_config.use_replayssm
+        is_mamba2 = kv_cache_spec.mamba_type == MambaAttentionBackendEnum.MAMBA2
+        self.use_replayssm = is_mamba2 and vllm_config.cache_config.use_replayssm
         self.replayssm_buffer_len = vllm_config.cache_config.replayssm_buffer_len
         self.use_flashinfer_replayssm = (
             self.use_replayssm
             and vllm_config.mamba_config.backend == MambaBackendEnum.FLASHINFER
         )
-        self.use_replayssm_spec = vllm_config.cache_config.use_replayssm_spec
+        self.use_replayssm_spec = (
+            is_mamba2 and vllm_config.cache_config.use_replayssm_spec
+        )
         self.max_spec_len = 1 + self.num_spec_tokens
         self.spec_flush_threshold = self.replayssm_buffer_len + self.max_spec_len
         self.spec_ring_len = MambaStateShapeCalculator.replayssm_spec_ring_len(

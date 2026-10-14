@@ -48,6 +48,50 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+@pytest.mark.parametrize("replayssm", [False, True])
+@pytest.mark.parametrize("num_spec", [0, 2, 3])
+def test_gdn_cache_spec_matches_layer_with_replayssm(replayssm, num_spec):
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    hf = _text_config()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16, hf_text_config=hf),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
+            use_replayssm_spec=replayssm,
+            replayssm_buffer_len=32,
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        speculative_config=SimpleNamespace(num_speculative_tokens=num_spec),
+    )
+    layer = SimpleNamespace(
+        model_config=config.model_config,
+        cache_config=config.cache_config,
+        tp_size=2,
+        num_k_heads=hf.linear_num_key_heads,
+        num_v_heads=hf.linear_num_value_heads,
+        head_k_dim=hf.linear_key_head_dim,
+        head_v_dim=hf.linear_value_head_dim,
+        conv_kernel_size=hf.linear_conv_kernel_dim,
+        num_spec=num_spec,
+    )
+    declared = Qwen4ExpForCausalLM.get_mamba_specs_from_config(config)[0]
+    actual = MambaSpec(
+        block_size=-1,
+        shapes=QwenGatedDeltaNetAttention.get_state_shape(layer),
+        dtypes=QwenGatedDeltaNetAttention.get_state_dtype(layer),
+    )
+    assert len(declared.shapes) == len(declared.dtypes)
+    assert declared.shapes == actual.shapes
+    assert declared.dtypes == actual.dtypes
+    assert declared.page_size_bytes == actual.page_size_bytes
+
+
 def test_qwen4_exp_mtp_returns_sample_and_multi_streams() -> None:
     from vllm.models.qwen4_exp.nvidia.mtp import (
         Qwen4ExpMultiTokenPredictor,

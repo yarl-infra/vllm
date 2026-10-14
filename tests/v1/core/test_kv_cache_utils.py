@@ -4162,7 +4162,8 @@ def test_deepseek_v4_annotation_requires_model_type():
     assert not any(g.is_eagle_group for g in groups)
 
 
-def test_qwen35_mtp_marks_attention_group_but_not_mamba(caplog_vllm):
+@pytest.mark.parametrize("model_type", ["qwen3_5_moe", "qwen4_exp", "qwen4_exp_text"])
+def test_qwen_mtp_marks_attention_group_but_not_mamba(caplog_vllm, model_type):
     # Qwen3.5's MTP layer has the same ordinary cache spec as target attention
     # layers. The model-scoped name fallback must work on the non-packed cache
     # layout used on B300 and keep aligned Mamba outside the volatile draft
@@ -4176,7 +4177,7 @@ def test_qwen35_mtp_marks_attention_group_but_not_mamba(caplog_vllm):
     }
     groups = get_kv_cache_groups(
         _spec_decode_grouping_config(
-            method="mtp", model_type="qwen3_5_moe", block_outermost=False
+            method="mtp", model_type=model_type, block_outermost=False
         ),
         specs,
     )
