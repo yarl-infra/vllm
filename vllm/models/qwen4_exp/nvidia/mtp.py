@@ -21,7 +21,7 @@ from torch import nn
 from transformers import Qwen4ExpTextConfig
 
 from vllm import envs
-from vllm.config import VllmConfig, replace, set_current_vllm_config
+from vllm.config import AuxOutputConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.utils import (
@@ -35,7 +35,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.utils import configure_quant_config
-from vllm.model_executor.models.interfaces import SupportsHCSP, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    SupportsHCSP,
+    SupportsPP,
+    SupportsReplaySSM,
+)
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -162,6 +166,8 @@ def _make_draft_vllm_config(
     draft_vllm_config = replace(
         vllm_config,
         model_config=speculative_config.draft_model_config,
+        # Only the target forward contributes routed experts to the response.
+        aux_output_config=AuxOutputConfig(),
     )
     # VllmConfig post-init derives the target quant config, so restore the
     # independently resolved draft quant config after replacement.
@@ -399,7 +405,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return loader.load_weights(weights, mapper=mapper)
 
 
-class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts):
+class Qwen4ExpMTP(
+    nn.Module, SupportsHCSP, SupportsPP, SupportsReplaySSM, Qwen4ExpMixtureOfExperts
+):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],

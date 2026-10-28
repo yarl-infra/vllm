@@ -52,6 +52,8 @@ def _group_kv_bytes_per_block(group: "KVCacheGroupSpec") -> int:
     configs flatten that wrapper to one representative per-layer spec.  Keep
     the result invariant across those two representations.
     """
+    if group.kv_cache_bytes_per_block is not None:
+        return group.kv_cache_bytes_per_block
     spec = group.kv_cache_spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
         return spec.page_size_bytes

@@ -1521,6 +1521,9 @@ class KVCacheGroupSpec:
     enable_kv_transfer: bool = True
     role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT
 
+    # Retain physical group bytes when the scheduler flattens a uniform wrapper.
+    kv_cache_bytes_per_block: int | None = None
+
 
 @dataclass
 class KVCacheConfig:

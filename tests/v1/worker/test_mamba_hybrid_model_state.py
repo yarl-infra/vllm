@@ -13,17 +13,41 @@ from tests.v1.attention.test_gdn_metadata_builder import (
     DEVICE,
     _create_gdn_builder,
 )
-from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+from tests.v1.attention.utils import (
+    BatchSpec,
+    create_common_attn_metadata,
+    create_vllm_config,
+)
+from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.recoverssm_metadata import (
     RecoverSSMMetadata,
     RecoverSSMPostprocessMetadata,
 )
+from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.worker.gpu.model_states import mamba_hybrid
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.utils import AttentionGroup
+
+
+def _new_mamba_hybrid_state(
+    num_speculative_tokens: int = 0, mamba_block_size: int | None = None
+) -> MambaHybridModelState:
+    config = create_vllm_config(
+        max_model_len=8192, max_num_seqs=4, max_num_batched_tokens=32
+    )
+    config.cache_config.mamba_cache_mode = (
+        "align" if mamba_block_size is not None else "none"
+    )
+    config.cache_config.mamba_block_size = mamba_block_size
+    if num_speculative_tokens:
+        config.speculative_config = SpeculativeConfig(
+            method="ngram", num_speculative_tokens=num_speculative_tokens
+        )
+    # These tests exercise request and attention metadata, not model forwards.
+    return MambaHybridModelState(config, torch.nn.Identity(), None, torch.device("cpu"))
 
 
 def _recoverssm_attn_groups(layer_name: str) -> list[list[AttentionGroup]]:
@@ -41,6 +65,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
     state.vllm_config = SimpleNamespace(num_speculative_tokens=0)
     state.model_config = SimpleNamespace(max_model_len=8192)
     state._align_mode = False
+    state._use_replayssm = False
     state.recoverssm = None
 
     positions = torch.tensor([1536], dtype=torch.int64)
@@ -81,15 +106,20 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_add_request_seeds_state_idx_in_mamba_blocks() -> None:
     """A drafter group can lower cache_config.block_size below the mamba
     block size; the seeded column must still be in mamba blocks."""
-    state = object.__new__(MambaHybridModelState)
-    state.cache_config = SimpleNamespace(block_size=16, mamba_block_size=880)
-    state._align_mode = True
-    state.rope_state = None
-    state.prompt_embeds_state = None
-    state.num_accepted_tokens_gpu = torch.ones(2, dtype=torch.int32)
-    state._mamba_state_idx_gpu = torch.zeros(2, dtype=torch.int32)
-
-    state.add_request(1, SimpleNamespace(num_computed_tokens=107_360))
+    state = _new_mamba_hybrid_state(mamba_block_size=880)
+    state.add_request(
+        1,
+        NewRequestData(
+            req_id="resumed",
+            prompt_token_ids=[1],
+            mm_features=[],
+            sampling_params=None,
+            pooling_params=None,
+            block_ids=([],),
+            num_computed_tokens=107_360,
+            lora_request=None,
+        ),
+    )
 
     assert state._mamba_state_idx_gpu[1] == 121
 
@@ -103,12 +133,7 @@ def test_padded_prompt_tail_builds_as_spec_decode(
     the recurrent state and can't be rolled back.
     """
     k = 3
-    state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=k)
-    state.model_config = SimpleNamespace(max_model_len=8192)
-    state._align_mode = False
-    state.recoverssm = None
-    state.num_accepted_tokens_gpu = torch.ones(4, dtype=torch.int32)
+    state = _new_mamba_hybrid_state(num_speculative_tokens=k)
 
     # A verify decode, a padded prompt tail (128 of 129 prompt tokens already
     # computed), and a fresh prompt chunk of the same length.
@@ -168,14 +193,10 @@ def test_padded_prompt_tail_builds_as_spec_decode(
 
 
 def _mamba_hybrid_state(num_speculative_tokens: int) -> MambaHybridModelState:
-    state = object.__new__(MambaHybridModelState)
-    state.vllm_config = SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
-    state.model_config = SimpleNamespace(max_model_len=8192)
-    state._align_mode = False
-    state.recoverssm = None
+    state = _new_mamba_hybrid_state(num_speculative_tokens=num_speculative_tokens)
     # A request that accepted 3 drafts (plus the bonus token) on the previous
     # step; the others have never had a draft accepted.
-    state.num_accepted_tokens_gpu = torch.tensor([4, 1, 1], dtype=torch.int32)
+    state.num_accepted_tokens_gpu[0] = 4
     return state
 
 
@@ -394,7 +415,101 @@ def test_recoverssm_commits_accepted_window_after_v2_sampling() -> None:
         num_accepted_tokens=num_accepted_tokens,
     )
 
-    metadata.commit_recoverssm_state.assert_called_once_with(num_sampled)
+    metadata.commit_recoverssm_state.assert_called_once()
+    (committed_counts,) = metadata.commit_recoverssm_state.call_args.args
+    torch.testing.assert_close(committed_counts, num_sampled)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_recoverssm_all_groups_see_same_accepted_token_snapshot() -> None:
+    """One group's align reset must not shorten later groups' commits."""
+    state = RecoverSSMState()
+    seen: list[torch.Tensor] = []
+
+    def commit(value: torch.Tensor) -> RecoverSSMPostprocessMetadata:
+        seen.append(value.clone())
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=1,
+            request_indices=None,
+            num_computed_tokens=torch.tensor([7], dtype=torch.int32, device="cuda"),
+            block_size=8,
+            block_table=torch.zeros((1, 4), dtype=torch.int32, device="cuda"),
+            reset_mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+        )
+
+    first = Mock(spec=RecoverSSMMetadata)
+    second = Mock(spec=RecoverSSMMetadata)
+    first.commit_recoverssm_state.side_effect = commit
+    second.commit_recoverssm_state.side_effect = commit
+    groups = [
+        [SimpleNamespace(layer_names=["gdn.0"])],
+        [SimpleNamespace(layer_names=["gdn.1"])],
+    ]
+    state.record_step({"gdn.0": first, "gdn.1": second}, groups, for_capture=False)
+
+    # Match GPUModelRunner: ``num_sampled`` is a view into the exact buffer
+    # passed as ``num_accepted_tokens`` below.
+    num_accepted = torch.tensor([3], dtype=torch.int32, device="cuda")
+    num_sampled = num_accepted[:1]
+    state_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+    state.commit_step(
+        num_sampled,
+        torch.tensor([0], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+        num_accepted_tokens=num_accepted,
+    )
+
+    assert [value.item() for value in seen] == [3, 3]
+    # The optimistic running page is preserved; both groups only consume the
+    # immutable accepted-count snapshot and mark the row as materialized.
+    assert state_indices.item() == 0
+    assert num_accepted.item() == -1
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+def test_recoverssm_snapshot_handles_mixed_acceptance_across_groups() -> None:
+    """Mixed accepted lengths must stay immutable for every cache group."""
+    state = RecoverSSMState()
+    seen: list[torch.Tensor] = []
+    num_computed = torch.tensor([7, 15, 7, 15], dtype=torch.int32, device="cuda")
+    reset_mask = torch.ones(4, dtype=torch.bool, device="cuda")
+
+    def commit(value: torch.Tensor) -> RecoverSSMPostprocessMetadata:
+        seen.append(value.clone())
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=4,
+            request_indices=None,
+            num_computed_tokens=num_computed,
+            block_size=8,
+            block_table=torch.zeros((4, 4), dtype=torch.int32, device="cuda"),
+            reset_mask=reset_mask,
+        )
+
+    metadata = [Mock(spec=RecoverSSMMetadata) for _ in range(3)]
+    for item in metadata:
+        item.commit_recoverssm_state.side_effect = commit
+    groups = [
+        [SimpleNamespace(layer_names=[f"gdn.{idx}"])] for idx in range(len(metadata))
+    ]
+    state.record_step(
+        {f"gdn.{idx}": item for idx, item in enumerate(metadata)},
+        groups,
+        for_capture=False,
+    )
+
+    num_accepted = torch.tensor([1, 2, 3, 2], dtype=torch.int32, device="cuda")
+    state_indices = torch.zeros(4, dtype=torch.int32, device="cuda")
+    state.commit_step(
+        num_accepted[:],
+        torch.arange(4, dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+        num_accepted_tokens=num_accepted,
+    )
+
+    expected_counts = [1, 2, 3, 2]
+    assert [value.tolist() for value in seen] == [expected_counts] * 3
+    assert state_indices.tolist() == [0, 0, 0, 0]
+    assert num_accepted.tolist() == [-1, -1, -1, -1]
 
 
 @pytest.mark.skipif(not HAS_GPU, reason="Requires CUDA or XPU")
@@ -433,7 +548,10 @@ def test_recoverssm_align_tracks_mixed_batch_state_and_neutralizes_copy_bias(
 
     state.postprocess_state(idx_mapping, num_sampled)
 
-    expected_state_indices = [-1, expected_column, -1, -1, -1]
+    expected_state_indices = [-1, -1, -1, -1, -1]
     assert state._mamba_state_idx_gpu.tolist() == expected_state_indices
-    expected_accepted = [9, 1, 9, 2, 9]
+    # This fixture intentionally omits the generic align postprocess that
+    # consumes RecoverSSM's private -1 sentinel and restores the public value
+    # to one.
+    expected_accepted = [9, -1, 9, 2, 9]
     assert state.num_accepted_tokens_gpu.tolist() == expected_accepted

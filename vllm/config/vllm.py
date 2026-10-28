@@ -3563,6 +3563,65 @@ class VllmConfig:
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_mamba_cached_spec_kernel(self) -> "VllmConfig":
+        if not self.cache_config.use_replayssm_spec:
+            return self
+        if self.cache_config.use_replayssm:
+            raise ValueError(
+                "--use-replayssm-spec is mutually exclusive with --use-replayssm "
+                "(different page shapes and decode paths)"
+            )
+        if self.model_config is not None and not self.model_config.supports_replayssm:
+            raise ValueError(
+                "--use-replayssm-spec is only supported for models that declare "
+                "ReplaySSM support via the SupportsReplaySSM interface "
+                f"(got architecture {self.model_config.architecture!r})"
+            )
+        # Inverted against --use-replayssm, which forbids speculative decoding.
+        if self.num_speculative_tokens <= 0:
+            raise ValueError(
+                "--use-replayssm-spec requires speculative decoding "
+                "(num_speculative_tokens > 0)"
+            )
+        if self.cache_config.mamba_cache_mode not in ("none", "align"):
+            raise ValueError(
+                "--use-replayssm-spec supports only none and align Mamba cache modes"
+            )
+        if self.mamba_config.backend != MambaBackendEnum.TRITON:
+            raise ValueError("--use-replayssm-spec requires --mamba-backend triton")
+        if self.mamba_config.enable_stochastic_rounding:
+            raise ValueError(
+                "--use-replayssm-spec does not support Mamba cache stochastic rounding"
+            )
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            native_aligned_offload = (
+                self.use_v2_model_runner
+                and self.kv_transfer_config.kv_connector == "OffloadingConnector"
+                and self.kv_transfer_config.kv_connector_module_path is None
+                and self.cache_config.mamba_cache_mode == "align"
+                and self.cache_config.enable_prefix_caching
+            )
+            if not native_aligned_offload:
+                raise ValueError(
+                    "--use-replayssm-spec only supports the native "
+                    "OffloadingConnector on model runner V2 with prefix caching and "
+                    "--mamba-cache-mode align; other KV connectors are unsupported"
+                )
+        # The ring holds L = B + max_spec_len slots and flushes once the next
+        # window would not fit, so B below max_spec_len can never seat a window.
+        max_spec_len = 1 + self.num_speculative_tokens
+        if self.cache_config.replayssm_buffer_len < max_spec_len:
+            raise ValueError(
+                "--use-replayssm-spec requires --replayssm-buffer-len >= "
+                f"1 + num_speculative_tokens ({max_spec_len}); got "
+                f"{self.cache_config.replayssm_buffer_len}"
+            )
+        return self
+
 
 _current_vllm_config: VllmConfig | None = None
 _current_prefix: str | None = None

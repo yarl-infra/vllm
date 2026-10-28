@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for translating vLLM cache metadata to native offloading config."""
 
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -39,6 +40,60 @@ from vllm.v1.kv_offload.file_mapper import FileMapper
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 
 
+@pytest.mark.parametrize("replayssm", [False, True])
+def test_replayssm_offload_excludes_unmaterialized_partial_tail(replayssm):
+    """A ReplaySSM page without its private cursors is only valid at a boundary."""
+    config = _make_vllm_config()
+    config.cache_config.use_replayssm_spec = replayssm
+    config.cache_config.prefix_match_unit = 4
+    config.speculative_config = None
+    kv_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(config, kv_config))
+    actual = SchedulerOffloadConfig.from_spec(spec, config, kv_config)
+    assert actual.supports_partial_tail is (not replayssm)
+
+
+@pytest.mark.parametrize(
+    "connector,mode,prefix,mrv2,allowed",
+    [
+        ("OffloadingConnector", "align", True, True, True),
+        ("OffloadingConnector", "align", True, False, False),
+        ("OffloadingConnector", "none", False, True, False),
+        ("SimpleCPUOffloadConnector", "align", True, True, False),
+        ("NixlConnector", "align", True, True, False),
+    ],
+)
+def test_replayssm_only_allows_canonical_native_offload(
+    connector, mode, prefix, mrv2, allowed
+):
+    """Do not widen support to connectors which can transfer live replay state."""
+    from vllm.config.mamba import MambaBackendEnum
+
+    config = SimpleNamespace(
+        model_config=None,
+        use_v2_model_runner=mrv2,
+        cache_config=SimpleNamespace(
+            use_replayssm_spec=True,
+            use_replayssm=False,
+            mamba_cache_mode=mode,
+            enable_prefix_caching=prefix,
+            replayssm_buffer_len=32,
+        ),
+        speculative_config=SimpleNamespace(),
+        num_speculative_tokens=2,
+        mamba_config=SimpleNamespace(
+            backend=MambaBackendEnum.TRITON,
+            enable_stochastic_rounding=False,
+        ),
+        kv_transfer_config=KVTransferConfig(kv_connector=connector, kv_role="kv_both"),
+    )
+    if allowed:
+        assert VllmConfig.validate_mamba_cached_spec_kernel(config) is config
+    else:
+        with pytest.raises(ValueError):
+            VllmConfig.validate_mamba_cached_spec_kernel(config)
+
+
 def _make_vllm_config(
     *,
     extra_config: dict[str, Any] | None = None,
@@ -53,6 +108,7 @@ def _make_vllm_config(
     config.cache_config.prefix_match_unit = None
     config.cache_config.cache_dtype = torch.float16
     config.cache_config.prefix_cache_retention_interval = None
+    config.cache_config.use_replayssm_spec = False
     config.model_config.model = "test-model"
     config.model_config.max_model_len = 4096
     config.model_config.use_mla = False
@@ -98,6 +154,22 @@ def _make_kv_cache_config() -> KVCacheConfig:
         kv_cache_tensors=[kv_tensor],
         kv_cache_groups=[KVCacheGroupSpec(["layer"], spec)],
     )
+
+
+def test_offloading_excludes_non_cacheable_compression_scratch():
+    config = _make_vllm_config()
+    kv_config = _make_kv_cache_config()
+    kv_config.kv_cache_groups.append(
+        KVCacheGroupSpec(
+            ["compression_scratch"],
+            CircularBufferSpec(
+                block_size=8, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        )
+    )
+    actual = build_offloading_config(config, kv_config)
+    assert [group.group_id for group in actual.groups] == [0]
+    assert actual.cache.tokens_per_hash == 16
 
 
 def _make_sizing_kv_cache_config(packed: bool) -> KVCacheConfig:
@@ -1354,6 +1426,40 @@ def test_canonical_mla_dsa_rows_are_tp_independent(tp_size, scheduler):
     mapper = FileMapper.from_offloading_spec("/cache", spec, parallel_agnostic=True)
     assert mapper.get_run_config()["tp_size"] == 1
     assert mapper.get_run_config()["replicated_layout"] is True
+
+
+@pytest.mark.parametrize("page_elements", [(16, 32), (32, 16), (16, 16)])
+def test_scheduler_preserves_heterogeneous_group_byte_size(page_elements):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        _group_kv_bytes_per_block,
+    )
+
+    specs = {
+        f"layer{i}": MambaSpec(
+            block_size=16, shapes=((size,),), dtypes=(torch.float32,)
+        )
+        for i, size in enumerate(page_elements)
+    }
+    group = KVCacheGroupSpec(
+        list(specs), UniformTypeKVCacheSpecs(block_size=16, kv_cache_specs=specs)
+    )
+    worker_config = KVCacheConfig(
+        num_blocks=4, kv_cache_tensors=[], kv_cache_groups=[group]
+    )
+    scheduler_config = generate_scheduler_kv_cache_config([worker_config])
+    scheduler_group = scheduler_config.kv_cache_groups[0]
+    expected_bytes = sum(page_elements) * torch.float32.itemsize
+
+    assert _group_kv_bytes_per_block(group) == expected_bytes
+    assert _group_kv_bytes_per_block(scheduler_group) == expected_bytes
+    assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    assert isinstance(scheduler_group.kv_cache_spec, MambaSpec)
+    assert (
+        _group_kv_bytes_per_block(
+            generate_scheduler_kv_cache_config([scheduler_config]).kv_cache_groups[0]
+        )
+        == expected_bytes
+    )
 
 
 def test_parallelism_agnostic_disabled_on_v2_model_runner():

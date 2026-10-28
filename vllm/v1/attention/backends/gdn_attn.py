@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Backend for GatedDeltaNet attention."""
 
+from __future__ import annotations
+
 import math
-from dataclasses import dataclass, replace
-from typing import Literal
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -14,12 +16,17 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     MambaPrefillCheckpointBuilder,
     MambaPrefillCheckpointMetadata,
 )
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+)
+from vllm.v1.attention.backends.recoverssm_metadata import (
+    RecoverSSMMetadata,
+    RecoverSSMPostprocessMetadata,
 )
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -71,13 +78,19 @@ class GDNFlashInferCheckpointPlan:
     rows: torch.Tensor
 
 
+if TYPE_CHECKING:
+    from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_prefix import (
+        GDNReplaySSMPrefixCommitContext,
+    )
+
+
 class GDNAttentionBackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
         return "GDN_ATTN"
 
     @staticmethod
-    def get_builder_cls() -> type["GDNAttentionMetadataBuilder"]:
+    def get_builder_cls() -> type[GDNAttentionMetadataBuilder]:
         return GDNAttentionMetadataBuilder
 
     @classmethod
@@ -86,7 +99,22 @@ class GDNAttentionBackend(AttentionBackend):
 
 
 @dataclass
-class GDNAttentionMetadata:
+class GDNReplaySSMAlignMetadata:
+    block_table: torch.Tensor
+    num_computed_tokens: torch.Tensor
+    block_size: int
+
+
+@dataclass
+class GDNReplaySSMCommitMetadata:
+    state_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    request_indices: torch.Tensor | None
+    align: GDNReplaySSMAlignMetadata
+
+
+@dataclass
+class GDNAttentionMetadata(RecoverSSMMetadata):
     num_prefills: int
     num_prefill_tokens: int
     num_decodes: int
@@ -116,6 +144,18 @@ class GDNAttentionMetadata:
     num_accepted_tokens: torch.Tensor | None = None  # shape: [batch,]
     uniform_spec_sequence_length: int | None = None  # None for ragged batches
 
+    # ReplaySSM spec ring cursors: block-keyed (num_blocks,) buffers indexed by
+    # spec_state_indices_tensor[:, 0], advanced on-device once per step by
+    # commit_gdn_replayssm_spec. None unless use_replayssm_spec is enabled.
+    spec_write_pos_d: torch.Tensor | None = None
+    spec_cache_base_d: torch.Tensor | None = None
+    spec_is_flush_d: torch.Tensor | None = None
+
+    replayssm_commit: GDNReplaySSMCommitMetadata | None = None
+    replayssm_context: GDNReplaySSMPrefixCommitContext | None = field(
+        default=None, repr=False, compare=False
+    )
+
     # Pre-computed FLA chunk metadata (avoids GPU->CPU sync in prepare_chunk_indices)
     chunk_indices: torch.Tensor | None = None
     chunk_offsets: torch.Tensor | None = None
@@ -130,12 +170,40 @@ class GDNAttentionMetadata:
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
 
+    def commit_recoverssm_state(
+        self, num_accepted_tokens: torch.Tensor
+    ) -> RecoverSSMPostprocessMetadata | None:
+        commit = self.replayssm_commit
+        if commit is None:
+            return None
+        context = self.replayssm_context
+        assert context is not None
+        align = commit.align
+        reset_mask = context.commit(
+            num_accepted_tokens,
+            commit.state_indices[: self.num_spec_decodes, 0],
+            commit.query_start_loc[: self.num_spec_decodes + 1],
+            request_indices=commit.request_indices,
+            block_table=align.block_table,
+            num_computed_tokens=align.num_computed_tokens,
+            mamba_block_size=align.block_size,
+        )
+        return RecoverSSMPostprocessMetadata(
+            num_spec_decodes=self.num_spec_decodes,
+            request_indices=commit.request_indices,
+            block_table=align.block_table,
+            num_computed_tokens=align.num_computed_tokens,
+            block_size=align.block_size,
+            reset_mask=reset_mask,
+        )
+
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
     kv_cache_spec: MambaSpec
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     reorder_batch_threshold: int = 1
+    mamba_aligned_state_indices: torch.Tensor | None = None
 
     def __init__(
         self,
@@ -176,6 +244,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_spec_decode: bool = self.num_spec > 0
         self._init_reorder_batch_threshold(1, self.use_spec_decode)
 
+        self.use_replayssm_spec: bool = vllm_config.cache_config.use_replayssm_spec
+        self.use_replayssm_prefix = (
+            self.use_replayssm_spec
+            and vllm_config.cache_config.mamba_cache_mode == "align"
+        )
+        self.replayssm_buffer_len: int = vllm_config.cache_config.replayssm_buffer_len
+        self.max_spec_len: int = 1 + self.num_spec
+        # Flush once the next window would not fit: threshold L = B + max_spec_len,
+        # physical ring next_pow2(L). Cursors are sized from num_gpu_blocks, which
+        # is only known after profiling, so they are allocated on the first build.
+        self.spec_flush_threshold = self.replayssm_buffer_len + self.max_spec_len
+        self.spec_ring_len = MambaStateShapeCalculator.replayssm_spec_ring_len(
+            self.replayssm_buffer_len, self.num_spec
+        )
+        self.spec_write_pos: torch.Tensor | None = None
+        self.spec_cache_base: torch.Tensor | None = None
+        self.spec_is_flush: torch.Tensor | None = None
+        self.replayssm_context: GDNReplaySSMPrefixCommitContext | None = None
+
         self.use_full_cuda_graph: bool = (
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
@@ -187,6 +274,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and device.type == "cuda"
             # Not isinstance: KDA's RecoverSSM/checkpoint metadata is per group.
             and type(self) is GDNAttentionMetadataBuilder
+            # ReplaySSM also carries group-local cursors and prefix commit
+            # context. Regathering only state indices would retain another
+            # group's ring and update the wrong checkpoint pages.
+            and not self.use_replayssm_spec
         )
         if self.supports_update_block_table:
             # Opts into MRV2's CUDA-only aligned-index precompute.
@@ -244,7 +335,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
     @staticmethod
     def _check_chunk_metadata_override(
-        builder_cls: type["GDNAttentionMetadataBuilder"], backend: str
+        builder_cls: type[GDNAttentionMetadataBuilder], backend: str
     ) -> None:
         """Reject a subclass whose chunk metadata the AITER path would skip.
 
@@ -316,12 +407,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         common_attn_metadata: CommonAttentionMetadata,
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
+        replayssm_reset_ring_cpu: torch.Tensor | None = None,
+        replayssm_boundary_reset: torch.Tensor | None = None,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
         aligned_state_indices = getattr(self, "mamba_aligned_state_indices", None)
         if aligned_state_indices is not None:
@@ -336,7 +430,30 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         uniform_spec_sequence_length = None
         spec_sequence_masks_cpu: torch.Tensor | None = None
-        if not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
+        if self.use_replayssm_spec and num_accepted_tokens is not None:
+            # Every post-prefill row runs the spec kernel, a draft-less row as a
+            # T=1 window. The baseline decode path reads the checkpoint page,
+            # which lags the committed ring, so routing a decode row there
+            # corrupts the state. num_decode_draft_tokens_cpu cannot drive this
+            # mask: it is stale on draft-less steps and -1 for decode rows whose
+            # drafts were dropped.
+            is_prefilling_cpu = m.is_prefilling
+            assert is_prefilling_cpu is not None
+            query_lens_cpu_all = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            spec_sequence_masks_cpu = (
+                (~is_prefilling_cpu[: query_lens_cpu_all.shape[0]])
+                & (query_lens_cpu_all > 0)
+                & (query_lens_cpu_all <= self.max_spec_len)
+            )
+            num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+            if num_spec_decodes == 0:
+                spec_sequence_masks = None
+                spec_sequence_masks_cpu = None
+            else:
+                spec_sequence_masks = async_tensor_h2d(
+                    spec_sequence_masks_cpu, device=query_start_loc.device
+                )
+        elif not self.use_spec_decode or num_decode_draft_tokens_cpu is None:
             spec_sequence_masks = None
             num_spec_decodes = 0
         else:
@@ -557,7 +674,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
         if num_prefills > 0:
-            context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
@@ -606,6 +722,25 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         assert not (num_decodes > 0 and num_spec_decodes > 0), (
             f"num_decodes: {num_decodes}, num_spec_decodes: {num_spec_decodes}"
         )
+
+        spec_write_pos_d = None
+        spec_cache_base_d = None
+        spec_is_flush_d = None
+        if self.use_replayssm_spec and num_spec_decodes > 0:
+            assert spec_state_indices_tensor is not None
+            assert num_accepted_tokens is not None
+            assert spec_sequence_masks_cpu is not None
+            spec_write_pos_d, spec_cache_base_d, spec_is_flush_d = (
+                self._commit_replayssm_spec_cursors(
+                    m,
+                    spec_state_indices_tensor,
+                    num_accepted_tokens,
+                    spec_sequence_masks_cpu,
+                    context_lens_tensor,
+                    replayssm_reset_ring_cpu,
+                    replayssm_boundary_reset,
+                )
+            )
 
         # Prepare per-request tensors for cudagraph. m.num_actual_tokens is
         # token-padded for FULL graph replay, but the GDN state/query/accepted
@@ -670,6 +805,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
             non_spec_query_start_loc[num_decodes + 1 :].fill_(non_spec_num_query_tokens)
 
+        replayssm_commit = None
+        if self.use_replayssm_prefix and num_spec_decodes > 0:
+            assert spec_state_indices_tensor is not None
+            assert spec_query_start_loc is not None
+            spec_request_indices = None
+            if num_prefills > 0 or num_decodes > 0:
+                assert spec_sequence_masks_cpu is not None
+                spec_request_indices = async_tensor_h2d(
+                    spec_sequence_masks_cpu.nonzero(as_tuple=True)[0],
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+            replayssm_commit = GDNReplaySSMCommitMetadata(
+                state_indices=spec_state_indices_tensor,
+                query_start_loc=spec_query_start_loc,
+                request_indices=spec_request_indices,
+                align=GDNReplaySSMAlignMetadata(
+                    block_table=m.block_table_tensor,
+                    num_computed_tokens=context_lens_tensor,
+                    block_size=self.kv_cache_spec.block_size,
+                ),
+            )
+
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -697,6 +855,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_token_indx=non_spec_token_indx,
             num_accepted_tokens=num_accepted_tokens,
             uniform_spec_sequence_length=uniform_spec_sequence_length,
+            spec_write_pos_d=spec_write_pos_d,
+            spec_cache_base_d=spec_cache_base_d,
+            spec_is_flush_d=spec_is_flush_d,
+            replayssm_commit=replayssm_commit,
+            replayssm_context=(
+                self._get_replayssm_prefix_context()
+                if replayssm_commit is not None
+                else None
+            ),
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
@@ -788,6 +955,127 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             checkpoint=checkpoint,
         )
 
+    def _get_replayssm_prefix_context(self) -> GDNReplaySSMPrefixCommitContext:
+        context = self.replayssm_context
+        if context is not None:
+            return context
+        assert self.spec_write_pos is not None
+        assert self.spec_cache_base is not None
+        assert self.spec_is_flush is not None
+        from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_prefix import (
+            GDNReplaySSMPrefixCommitContext,
+        )
+
+        forward_context = self.vllm_config.compilation_config.static_forward_context
+        layers = [forward_context[layer_name] for layer_name in self.layer_names]
+        context = GDNReplaySSMPrefixCommitContext.create(
+            layers,
+            write_pos=self.spec_write_pos,
+            cache_base=self.spec_cache_base,
+            is_flush=self.spec_is_flush,
+            spec_query_len=self.max_spec_len,
+            max_num_reqs=self.vllm_config.scheduler_config.max_num_seqs,
+            max_cache_len=self.spec_flush_threshold,
+        )
+        self.replayssm_context = context
+        return context
+
+    def _commit_replayssm_spec_cursors(
+        self,
+        m: CommonAttentionMetadata,
+        spec_state_indices_tensor: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        spec_sequence_masks_cpu: torch.Tensor,
+        context_lens_tensor: torch.Tensor,
+        reset_ring_cpu: torch.Tensor | None,
+        boundary_reset: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Advance the block-keyed spec ring cursors for this step.
+
+        Commits the previous step's accepted tokens and decides this step's
+        is_flush on-device, then resets rows entering decode. Both run as fixed
+        launches so the captured graph is identical every step.
+        """
+        from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_spec_decode import (  # noqa: E501
+            commit_gdn_replayssm_spec,
+            reset_gdn_replayssm_spec_cursors,
+        )
+
+        device = spec_state_indices_tensor.device
+        if self.spec_write_pos is None:
+            num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
+            if not num_gpu_blocks:
+                raise ValueError(
+                    "--use-replayssm-spec needs num_gpu_blocks at build time to "
+                    "size the block-keyed cursor buffers"
+                )
+            self.spec_write_pos = torch.zeros(
+                num_gpu_blocks, dtype=torch.int32, device=device
+            )
+            self.spec_cache_base = torch.zeros(
+                num_gpu_blocks, dtype=torch.int32, device=device
+            )
+            self.spec_is_flush = torch.zeros(
+                num_gpu_blocks, dtype=torch.int8, device=device
+            )
+        assert self.spec_cache_base is not None and self.spec_is_flush is not None
+
+        block_ids = spec_state_indices_tensor[:, 0]
+        # Commit first: acceptance is only known after the previous step's
+        # sampling, so folding it into this build keeps every cursor update
+        # on-device and avoids a device-to-host sync on num_accepted_tokens.
+        if not self.use_replayssm_prefix:
+            commit_gdn_replayssm_spec(
+                self.spec_write_pos,
+                self.spec_cache_base,
+                self.spec_is_flush,
+                num_accepted_tokens.to(torch.int32),
+                block_ids,
+                max_cache_len=self.spec_flush_threshold,
+                max_spec_len=self.max_spec_len,
+                cache_buf_len=self.spec_ring_len,
+            )
+
+        if reset_ring_cpu is not None:
+            # V2 passes an explicit one-shot admission bit.  Its async context
+            # accounting can expose both prefill_len - 1 and prefill_len on the
+            # first two decode builds, so length comparisons are ambiguous.
+            reset_ring_full = reset_ring_cpu.to(device, non_blocking=True)
+        else:
+            # V1 keeps the admission origin in GPUInputBatch and has exact
+            # context accounting, so retain its established equality fallback.
+            decode_base_cpu = m.replayssm_decode_base_cpu
+            if decode_base_cpu is None:
+                raise ValueError(
+                    "--use-replayssm-spec requires an admission reset signal"
+                )
+            decode_base_d = decode_base_cpu.to(device, non_blocking=True)
+            reset_ring_full = (
+                context_lens_tensor[: decode_base_d.shape[0]] == decode_base_d
+            ).to(torch.int8)
+        if boundary_reset is not None:
+            # Generic align pre-copy migrates checkpoint/conv state but not the
+            # private ReplaySSM ring.  Reset the destination on the exact step
+            # where preprocess_state changed the running page.  A page-number
+            # lookahead remains true for several adjacent speculative windows
+            # and would repeatedly discard accepted tokens from the new ring.
+            reset_ring_full = torch.maximum(
+                reset_ring_full[: boundary_reset.shape[0]], boundary_reset
+            )
+        spec_row_idx = spec_sequence_masks_cpu.nonzero(as_tuple=True)[0].to(
+            device, non_blocking=True
+        )
+        reset_gdn_replayssm_spec_cursors(
+            self.spec_write_pos,
+            self.spec_cache_base,
+            self.spec_is_flush,
+            reset_ring_full.index_select(0, spec_row_idx),
+            block_ids,
+            max_cache_len=self.spec_flush_threshold,
+            max_spec_len=self.max_spec_len,
+        )
+        return self.spec_write_pos, self.spec_cache_base, self.spec_is_flush
+
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ):
@@ -810,5 +1098,17 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
+        replayssm_reset_ring_cpu = (
+            torch.zeros(m.num_reqs, dtype=torch.int8)
+            if self.use_replayssm_spec
+            else None
+        )
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        return self.build(
+            0,
+            m,
+            num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+            replayssm_reset_ring_cpu,
+            None,
+        )

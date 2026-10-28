@@ -5,8 +5,10 @@ BaseMambaAttentionMetadataBuilder: write_pos and is_flush computed from the
 per-request ring origin (replayssm_decode_base) and num_computed.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -19,10 +21,288 @@ from tests.v1.attention.utils import (
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.mamba import MambaBackendEnum
+from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.short_conv_attn import (
+    PleShortConvAttentionMetadataBuilder,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
+
+
+def test_gdn_replay_admission_reset_includes_decode_promoted_prompt_tail():
+    from vllm.v1.core.sched.output import NewRequestData
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+    from vllm.v1.worker.utils import AttentionGroup
+
+    config = create_vllm_config(max_num_seqs=4, max_num_batched_tokens=32)
+    config.cache_config.use_replayssm_spec = True
+    config.cache_config.mamba_cache_mode = "none"
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    device = torch.device("cuda")
+    # Only request/attention metadata is exercised; no model forward is needed.
+    state = MambaHybridModelState(config, torch.nn.Identity(), None, device)
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((7, 8), (1, 8, 8)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    group = AttentionGroup(
+        MambaAttentionBackendEnum.GDN_ATTN.get_class(), ["gdn"], spec, 0
+    )
+    group.create_metadata_builders(config, device)
+    kv = KVCacheConfig(
+        num_blocks=1000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(["gdn"], spec)],
+    )
+    batch = InputBatch.make_dummy(1, 4, InputBuffers(4, 32, device), is_padding=False)
+    batch = replace(
+        batch,
+        seq_lens=torch.tensor([20], dtype=torch.int32, device=device),
+        seq_lens_cpu_upper_bound=torch.tensor([20], dtype=torch.int32),
+        is_prefilling_np=np.array([True]),
+        has_prefill=True,
+        prefill_runs_as_decode_np=np.array([True]),
+        num_draft_tokens=3,
+        num_draft_tokens_per_req=np.array([3], dtype=np.int32),
+    )
+    state.add_request(
+        0,
+        NewRequestData(
+            req_id=batch.req_ids[0],
+            prompt_token_ids=[1] * 17,
+            mm_features=[],
+            sampling_params=None,
+            pooling_params=None,
+            block_ids=([1, 2],),
+            num_computed_tokens=16,
+            lora_request=None,
+        ),
+    )
+    block_table = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32, device=device)
+
+    def build(current):
+        return state.prepare_attn(
+            current,
+            CUDAGraphMode.NONE,
+            (block_table,),
+            torch.zeros((1, 4), dtype=torch.int64, device=device),
+            [[group]],
+            kv,
+        )["gdn"]
+
+    tail = build(batch)
+    assert tail.num_spec_decodes == 1 and tail.num_prefills == 0
+    block_id = tail.spec_state_indices_tensor[0, 0].item()
+    assert tail.spec_write_pos_d[block_id].item() == 0
+    # The admission reset must be consumed by the promoted prompt tail, not
+    # delayed until the next step, which would discard accepted ring entries.
+    decode = replace(
+        batch,
+        is_prefilling_np=np.array([False]),
+        has_prefill=False,
+        prefill_runs_as_decode_np=None,
+    )
+    assert build(decode).spec_write_pos_d[block_id].item() == 1
+    assert build(decode).spec_write_pos_d[block_id].item() == 2
+
+
+def test_gdn_replay_metadata_keeps_group_local_ring_cursors():
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
+    from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridAttnMetadata
+    from vllm.v1.worker.utils import AttentionGroup
+
+    config = create_vllm_config(max_num_seqs=4, max_num_batched_tokens=32)
+    config.cache_config.use_replayssm_spec = True
+    config.cache_config.mamba_cache_mode = "none"
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    device = torch.device("cuda")
+    spec = MambaSpec(
+        block_size=16,
+        shapes=((7, 8), (1, 8, 8)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    groups = [
+        AttentionGroup(
+            MambaAttentionBackendEnum.GDN_ATTN.get_class(), [f"gdn{i}"], spec, i
+        )
+        for i in range(2)
+    ]
+    for group in groups:
+        group.create_metadata_builders(config, device)
+    kv = KVCacheConfig(
+        num_blocks=1000,
+        kv_cache_tensors=[],
+        kv_cache_groups=[KVCacheGroupSpec(g.layer_names, spec) for g in groups],
+    )
+    metadata = build_attn_metadata(
+        [[g] for g in groups],
+        num_reqs=1,
+        num_tokens=4,
+        query_start_loc_gpu=torch.tensor([0, 4], device=device, dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        max_query_len=4,
+        seq_lens=torch.tensor([20], device=device, dtype=torch.int32),
+        max_seq_len=20,
+        block_tables=[
+            torch.tensor([[b]], device=device, dtype=torch.int32) for b in (2, 8)
+        ],
+        slot_mappings=torch.zeros((2, 4), device=device, dtype=torch.int64),
+        kv_cache_config=kv,
+        seq_lens_cpu_upper_bound=torch.tensor([20], dtype=torch.int32),
+        model_specific_attn_metadata=MambaHybridAttnMetadata(
+            is_prefilling=torch.tensor([False]),
+            num_accepted_tokens=torch.tensor([1], device=device, dtype=torch.int32),
+            num_decode_draft_tokens_cpu=torch.tensor([3], dtype=torch.int32),
+            replayssm_reset_ring_cpu=torch.tensor([0], dtype=torch.int8),
+        ),
+    )
+    for i in range(2):
+        meta = metadata[f"gdn{i}"]
+        block_id = meta.spec_state_indices_tensor[0, 0].item()
+        assert meta.spec_write_pos_d[block_id].item() == 1
+    assert (
+        metadata["gdn0"].spec_write_pos_d.data_ptr()
+        != metadata["gdn1"].spec_write_pos_d.data_ptr()
+    )
+
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
+
+
+def _make_spec_replay_config(num_spec: int, mode: str):
+    return SimpleNamespace(
+        cache_config=SimpleNamespace(
+            use_replayssm=mode == "decode",
+            use_replayssm_spec=mode == "spec",
+            replayssm_buffer_len=16,
+            mamba_cache_mode="align",
+        ),
+        mamba_config=SimpleNamespace(backend=MambaBackendEnum.TRITON),
+        compilation_config=SimpleNamespace(
+            cudagraph_mode=CUDAGraphMode.NONE,
+            max_cudagraph_capture_size=0,
+        ),
+        speculative_config=SimpleNamespace(
+            num_speculative_tokens=num_spec, parallel_drafting=False
+        ),
+        num_speculative_tokens=num_spec,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+    )
+
+
+@pytest.mark.parametrize("num_spec", [2, 3])
+@pytest.mark.parametrize("mode", ["none", "decode", "spec"])
+def test_ple_spec_metadata_with_global_replayssm(
+    num_spec: int, mode: str, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr("vllm.utils.torch_utils.PIN_MEMORY", False)
+    config = _make_spec_replay_config(num_spec, mode)
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((9 + num_spec, 8),),
+        dtypes=(torch.float32,),
+        mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+    )
+    builder = PleShortConvAttentionMetadataBuilder(spec, ["ple"], config, DEVICE)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[32, 48], query_lens=[num_spec + 1] * 2),
+        BLOCK_SIZE,
+        DEVICE,
+    )
+    accepted = torch.tensor([1, num_spec], dtype=torch.int32)
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=torch.tensor([num_spec] * 2),
+    )
+    assert metadata.num_spec_decodes == 2
+    assert metadata.spec_query_start_loc is not None
+    assert metadata.spec_query_start_loc.tolist() == [
+        0,
+        num_spec + 1,
+        2 * (num_spec + 1),
+    ]
+    assert torch.equal(metadata.num_accepted_tokens, accepted)
+    assert torch.equal(
+        metadata.spec_state_indices_tensor, common.block_table_tensor[[0, 1], [1, 2]]
+    )
+    assert not builder.use_replayssm
+    assert not builder.use_replayssm_spec
+    assert config.cache_config.use_replayssm_spec == (mode == "spec")
+
+
+@pytest.mark.parametrize("valid_page", [False, True])
+def test_mamba2_spec_replay_still_validates_page(valid_page: bool):
+    config = _make_spec_replay_config(2, "spec")
+    shapes = ((4, 2), (1, 1, 1), (32, 2), (1, 32))
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=shapes if valid_page else shapes[:2],
+        dtypes=(torch.float32,) * (4 if valid_page else 2),
+        mamba_type=MambaAttentionBackendEnum.MAMBA2,
+    )
+    if not valid_page:
+        with pytest.raises(ValueError, match="4-tensor Mamba2 page"):
+            MockMambaBuilder(spec, ["mamba"], config, DEVICE)
+    else:
+        builder = MockMambaBuilder(spec, ["mamba"], config, DEVICE)
+        assert builder.use_replayssm_spec
+        assert builder.decode_spec_bc_pre is not None
+
+
+def test_spec_replay_reset_uses_exact_device_context_not_cpu_upper_bound():
+    config = create_vllm_config(model_name="Qwen/Qwen3.5-0.8B", max_num_seqs=4)
+    config.cache_config.use_replayssm_spec = True
+    config.cache_config.replayssm_buffer_len = 16
+    config.cache_config.mamba_cache_mode = "none"
+    config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=2
+    )
+    device = torch.device("cuda")
+    spec = MambaSpec(
+        block_size=BLOCK_SIZE,
+        shapes=((4, 3), (1, 1, 1), (32, 2), (1, 32)),
+        dtypes=(torch.float32,) * 4,
+        mamba_type=MambaAttentionBackendEnum.MAMBA2,
+    )
+    builder = Mamba2AttentionMetadataBuilder(spec, ["layer0"], config, device)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[7, 9, 5], query_lens=[3, 3, 1]),
+        BLOCK_SIZE,
+        device,
+        arange_block_indices=True,
+    ).replace(
+        seq_lens_cpu_upper_bound=torch.tensor([17, 19, 15], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False, True]),
+        replayssm_decode_base_cpu=torch.tensor([4, 5, 5], dtype=torch.int32),
+    )
+    metadata = builder.build(
+        0,
+        common,
+        num_accepted_tokens=torch.tensor([2, 2, 1], device=device),
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2, 0]),
+    )
+    assert metadata.spec_write_pos_d is not None
+    assert metadata.spec_is_flush_d is not None
+    # First decode resets, continuing decode commits, and a prompt tail flushes.
+    assert metadata.spec_write_pos_d[:3].tolist() == [0, 2, 0]
+    assert metadata.spec_is_flush_d[:3].tolist() == [0, 0, 1]
 
 
 @dataclass

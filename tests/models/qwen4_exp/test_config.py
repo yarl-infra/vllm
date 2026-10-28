@@ -55,6 +55,77 @@ def _text_config(**kwargs) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**values)
 
 
+@pytest.mark.parametrize("backend", ["amd", "nvidia"])
+def test_mtp_draft_keeps_routed_expert_collection_on_target_only(tmp_path, backend):
+    from vllm.engine.arg_utils import EngineArgs
+
+    make_draft_config = import_module(
+        f"vllm.models.qwen4_exp.{backend}.mtp"
+    )._make_draft_vllm_config
+
+    hf = Qwen4ExpConfig(text_config=_text_config().to_dict())
+    hf.architectures = ["Qwen4ExpForConditionalGeneration"]
+    hf.save_pretrained(tmp_path)
+    config = EngineArgs(
+        model=str(tmp_path),
+        skip_tokenizer_init=True,
+        enforce_eager=True,
+        language_model_only=True,
+        enable_prefix_caching=True,
+        enable_return_routed_experts=True,
+        engram_config={"cpu_offload": False},
+        speculative_config={"method": "mtp", "num_speculative_tokens": 3},
+    ).create_engine_config()
+    draft = make_draft_config(config, hf.text_config.num_hidden_layers)
+    assert draft.model_config is config.speculative_config.draft_model_config
+    assert not draft.aux_output_config.enabled
+    assert config.aux_output_config.enable_return_routed_experts
+
+
+@pytest.mark.parametrize("replayssm", [False, True])
+@pytest.mark.parametrize("num_spec", [0, 2, 3])
+def test_gdn_cache_spec_matches_layer_with_replayssm(replayssm, num_spec):
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+    from vllm.models.qwen4_exp.nvidia.model import Qwen4ExpForCausalLM
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    hf = _text_config()
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype=torch.bfloat16, hf_text_config=hf),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
+            use_replayssm_spec=replayssm,
+            replayssm_buffer_len=32,
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        speculative_config=SimpleNamespace(num_speculative_tokens=num_spec),
+    )
+    layer = SimpleNamespace(
+        model_config=config.model_config,
+        cache_config=config.cache_config,
+        tp_size=2,
+        num_k_heads=hf.linear_num_key_heads,
+        num_v_heads=hf.linear_num_value_heads,
+        head_k_dim=hf.linear_key_head_dim,
+        head_v_dim=hf.linear_value_head_dim,
+        conv_kernel_size=hf.linear_conv_kernel_dim,
+        num_spec=num_spec,
+    )
+    declared = Qwen4ExpForCausalLM.get_mamba_specs_from_config(config)[0]
+    actual = MambaSpec(
+        block_size=-1,
+        shapes=QwenGatedDeltaNetAttention.get_state_shape(layer),
+        dtypes=QwenGatedDeltaNetAttention.get_state_dtype(layer),
+    )
+    assert len(declared.shapes) == len(declared.dtypes)
+    assert declared.shapes == actual.shapes
+    assert declared.dtypes == actual.dtypes
+    assert declared.page_size_bytes == actual.page_size_bytes
+
+
 def test_moe_sp_rejects_pipeline_parallel() -> None:
     """Automatic MoE SP must validate HC topology even without --enable-hc-sp."""
     config = SimpleNamespace(

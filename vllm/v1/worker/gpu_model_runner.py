@@ -206,6 +206,7 @@ from vllm.v1.worker.gpu.eplb_utils import (
     draft_model_supports_eplb,
     eplb_draft_model_name,
 )
+from vllm.v1.worker.gpu.model_states.recoverssm import RecoverSSMState
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
@@ -740,7 +741,8 @@ class GPUModelRunner(
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
-            use_replayssm=self.cache_config.use_replayssm,
+            use_replayssm=self.cache_config.use_replayssm
+            or self.cache_config.use_replayssm_spec,
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -957,6 +959,17 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+        self.replayssm_state = (
+            RecoverSSMState()
+            if self.cache_config.use_replayssm_spec
+            and self.cache_config.mamba_cache_mode == "align"
+            else None
+        )
+        self.replayssm_idx_mapping = (
+            torch.arange(self.max_num_reqs, dtype=torch.int32, device=self.device)
+            if self.replayssm_state is not None
+            else None
+        )
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1566,17 +1579,27 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
+            mamba_bufs = self._get_mamba_bufs()
+            if self.replayssm_state is not None:
+                ctx = mamba_bufs.postprocess_align
+                assert ctx is not None
+                assert ctx.mamba_state_idx_buf is not None
+                assert self.replayssm_idx_mapping is not None
+                self.replayssm_state.commit_step(
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.replayssm_idx_mapping[:num_reqs],
+                    state_indices=ctx.mamba_state_idx_buf.gpu,
+                    num_accepted_tokens=self.num_accepted_tokens.gpu,
+                )
             # Fused GPU postprocess: state copies + per-request accepted-token
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
             mamba_utils.postprocess_mamba_align_gpu(
-                bufs=self._get_mamba_bufs(),
+                bufs=mamba_bufs,
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
-                ),
+                num_accepted_tokens_cpu_tensor=self.num_accepted_tokens.cpu,
                 input_batch=self.input_batch,
                 kv_cache_config=self.kv_cache_config,
                 forward_context=self.compilation_config.static_forward_context,
@@ -1586,7 +1609,7 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
         else:
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+            self.num_accepted_tokens.cpu[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
             assert self.num_accepted_tokens_event is not None
@@ -1921,6 +1944,37 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _sync_num_accepted_tokens(
+        self, num_reqs: int, prev_req_id_to_index: dict[str, int] | None
+    ) -> None:
+        """Synchronize and remap accepted token counts into input_batch.
+
+        In async scheduling mode, remaps counts from runner.num_accepted_tokens.np
+        through prev_positions to account for row shifts from InputBatch.condense().
+        In sync mode, performs a direct write-back to input_batch.
+        """
+        if self.use_async_scheduling:
+            if prev_req_id_to_index:
+                # Remap the previous-iteration runner snapshot through prev_positions.
+                prev_idx = self.prev_positions.np[:num_reqs]
+                new_mask = prev_idx < 0
+                self.num_accepted_tokens.np[:num_reqs] = self.num_accepted_tokens.np[
+                    np.where(new_mask, 0, prev_idx)
+                ]
+                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                    self.num_accepted_tokens.np[:num_reqs]
+                )
+            else:
+                # Initial step or all-chunked-prefill step
+                self.num_accepted_tokens.np[:num_reqs].fill(1)
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs].fill(1)
+        else:
+            # Non-async mode: write back 1:1 to input_batch
+            self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                self.num_accepted_tokens.np[:num_reqs]
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2074,24 +2128,7 @@ class GPUModelRunner(
         if needs_cpu_accepted_counts:
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.synchronize()
-            # Async mode: condense() reordered indices, use prev_positions mapping
-            if self.use_async_scheduling and prev_req_id_to_index:
-                prev_idx = self.prev_positions.np[:num_reqs]
-                new_mask = prev_idx < 0
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[
-                        np.where(new_mask, 0, prev_idx)
-                    ]
-                )
-                self.num_accepted_tokens.np[:num_reqs][new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
-                    self.num_accepted_tokens.np[:num_reqs]
-                )
-            else:
-                # Non-async mode: use values directly
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
+            self._sync_num_accepted_tokens(num_reqs, prev_req_id_to_index)
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
         else:
@@ -2355,7 +2392,7 @@ class GPUModelRunner(
             rswa_prefix_lens = num_prompt_tokens_cpu
 
         replayssm_decode_base_cpu = None
-        if self.cache_config.use_replayssm:
+        if self.cache_config.use_replayssm or self.cache_config.use_replayssm_spec:
             replayssm_decode_base_cpu = (
                 self.input_batch.replayssm_decode_base_cpu_tensor[:num_reqs_padded]
             )
@@ -2424,7 +2461,19 @@ class GPUModelRunner(
             cache_key = (kv_cache_spec, type(builder))
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(
+            # use_spec_decode is step-level: it is False whenever the drafter
+            # proposed nothing anywhere in the batch. ReplaySSM-spec still needs
+            # the cursors on those steps, or the rows fall through to the
+            # baseline kernel and advance a checkpoint the ring has moved past.
+            needs_replayssm_spec_args = (
+                self.cache_config.use_replayssm_spec
+                and self.speculative_config is not None
+                and isinstance(
+                    builder,
+                    (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+                )
+            )
+            if (use_spec_decode or needs_replayssm_spec_args) and isinstance(
                 builder,
                 (
                     Mamba2AttentionMetadataBuilder,
@@ -2442,6 +2491,18 @@ class GPUModelRunner(
                         :num_reqs_padded
                     ],
                 )
+                if self.replayssm_state is not None and isinstance(
+                    builder, GDNAttentionMetadataBuilder
+                ):
+                    ctx = self._get_mamba_bufs().postprocess_align
+                    assert ctx is not None
+                    assert ctx.precopy_src_col_buf is not None
+                    assert ctx.mamba_state_idx_buf is not None
+                    src_col = ctx.precopy_src_col_buf.gpu[:num_reqs_padded]
+                    dst_col = ctx.mamba_state_idx_buf.gpu[:num_reqs_padded]
+                    extra_attn_metadata_args["replayssm_boundary_reset"] = (
+                        (src_col >= 0) & (src_col != dst_col)
+                    ).to(torch.int8)
 
             if for_cudagraph_capture:
                 attn_metadata_i = attn_group.build_metadata_for_cudagraph_capture(
@@ -4119,6 +4180,13 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+            if self.replayssm_state is not None:
+                assert isinstance(attn_metadata, dict)
+                self.replayssm_state.record_step(
+                    attn_metadata,
+                    self.attn_groups,
+                    for_capture=False,
+                )
 
             (
                 input_ids,
@@ -6893,7 +6961,8 @@ class GPUModelRunner(
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                     reasoning_config=self.vllm_config.reasoning_config,
-                    use_replayssm=self.cache_config.use_replayssm,
+                    use_replayssm=self.cache_config.use_replayssm
+                    or self.cache_config.use_replayssm_spec,
                     slot_mapping_modes=slot_mapping_modes,
                 )
 

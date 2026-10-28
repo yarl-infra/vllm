@@ -69,6 +69,33 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
 
 ## Notes
 
+### ReplaySSM in this fork
+
+This fork supports cached speculative state updates for ReplaySSM-capable
+hybrid models, including Qwen3.5 and Qwen3.8 Flash Next (`Qwen4Exp`). For example:
+
+```bash
+vllm serve /path/to/checkpoint \
+    --tensor-parallel-size 4 \
+    --mamba-backend triton --mamba-cache-mode align \
+    --enable-prefix-caching --use-replayssm-spec --replayssm-buffer-len 32 \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}'
+```
+
+`replayssm_buffer_len` controls the replay interval, not the number of draft
+tokens. It must be at least `1 + num_speculative_tokens`. The speculative path
+requires the Triton Mamba backend and supports `none` or `align` cache modes;
+it cannot be combined with `--use-replayssm` or stochastic Mamba-cache rounding.
+
+Native KV offload can be enabled with `--kv-offloading-backend native
+--kv-offloading-size 30`. ReplaySSM offload requires Model Runner V2, prefix
+caching and `--mamba-cache-mode align`; other KV connectors are rejected.
+Only materialized block boundaries are offloaded, because private replay-ring
+cursors are not transferred. Routed-expert return uses the upstream auxiliary
+output connector; the MTP drafter does not collect target-model routing rows.
+
+### General MTP notes
+
 - MTP only works for model families that support MTP in vLLM.
 - `num_speculative_tokens` controls speculative depth. A small value like `1`
   is a good default to start with.
